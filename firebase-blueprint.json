@@ -1,0 +1,129 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "A user profile in the application.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "User's email address"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["email", "createdAt"]
+    },
+    "CareerStats": {
+      "title": "CareerStats",
+      "description": "User's career statistics.",
+      "type": "object",
+      "properties": {
+        "wins": {
+          "type": "integer"
+        },
+        "losses": {
+          "type": "integer"
+        },
+        "battlesFought": {
+          "type": "integer"
+        },
+        "totalCreditsEarned": {
+          "type": "integer"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["wins", "losses", "battlesFought", "totalCreditsEarned", "updatedAt"]
+    },
+    "SavedBot": {
+      "title": "SavedBot",
+      "description": "A custom bot blueprint saved by the user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "parts": {
+          "type": "array",
+          "description": "Array of bot parts"
+        },
+        "rootPartId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["userId", "name", "parts", "rootPartId", "createdAt", "updatedAt"]
+    },
+    "MatchHistory": {
+      "title": "MatchHistory",
+      "description": "History of a user's match.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "playerBotName": {
+          "type": "string"
+        },
+        "opponentName": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "creditsEarned": {
+          "type": "integer"
+        },
+        "playerHealthRemaining": {
+          "type": "integer"
+        }
+      },
+      "required": ["userId", "timestamp", "playerBotName", "opponentName", "outcome", "creditsEarned", "playerHealthRemaining"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/User"
+      },
+      "description": "User profiles."
+    },
+    "users/{userId}/careerStats/stats": {
+      "schema": {
+        "$ref": "#/entities/CareerStats"
+      },
+      "description": "User's career statistics."
+    },
+    "users/{userId}/savedBots/{botId}": {
+      "schema": {
+        "$ref": "#/entities/SavedBot"
+      },
+      "description": "Bots saved by the user."
+    },
+    "users/{userId}/matchHistory/{matchId}": {
+      "schema": {
+        "$ref": "#/entities/MatchHistory"
+      },
+      "description": "User's match history."
+    }
+  }
+}

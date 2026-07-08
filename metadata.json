@@ -1,0 +1,8 @@
+{
+  "name": "BattleBots Combat Interface",
+  "description": "A high-fidelity 3D spectator dashboard and command center for a BattleBots experience.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

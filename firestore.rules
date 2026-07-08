@@ -1,0 +1,118 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    
+    function incoming() {
+      return request.resource.data;
+    }
+    
+    function existing() {
+      return resource.data;
+    }
+    
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+    
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'createdAt']) 
+        && data.keys().size() == 2
+        && data.email is string
+        && data.email.size() <= 256
+        && data.createdAt == request.time;
+    }
+    
+    function isValidUserUpdate(data) {
+      return data.email is string && data.email.size() <= 256;
+    }
+    
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidId(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && isValidId(userId) && isValidUserUpdate(incoming()) && incoming().diff(existing()).affectedKeys().hasOnly(['email']) && incoming().createdAt == existing().createdAt;
+      allow delete: if isOwner(userId);
+      
+      function isValidCareerStats(data) {
+        return data.keys().hasAll(['wins', 'losses', 'battlesFought', 'totalCreditsEarned', 'updatedAt'])
+          && data.keys().size() == 5
+          && data.wins is number
+          && data.losses is number
+          && data.battlesFought is number
+          && data.totalCreditsEarned is number
+          && data.updatedAt == request.time;
+      }
+      
+      match /careerStats/stats {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidCareerStats(incoming()) && exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isOwner(userId) && isValidCareerStats(incoming()) && exists(/databases/$(database)/documents/users/$(userId)) && incoming().diff(existing()).affectedKeys().hasOnly(['wins', 'losses', 'battlesFought', 'totalCreditsEarned', 'updatedAt']);
+        allow delete: if isOwner(userId);
+      }
+      
+      function isValidSavedBot(data) {
+        return data.keys().hasAll(['userId', 'name', 'parts', 'rootPartId', 'createdAt', 'updatedAt'])
+          && data.keys().size() == 6
+          && data.userId == request.auth.uid
+          && data.name is string
+          && data.name.size() <= 128
+          && data.parts is list
+          && data.parts.size() <= 50
+          && data.rootPartId is string
+          && data.rootPartId.size() <= 128
+          && data.createdAt == request.time
+          && data.updatedAt == request.time;
+      }
+      
+      function isValidSavedBotUpdate(data) {
+        return data.name is string
+          && data.name.size() <= 128
+          && data.parts is list
+          && data.parts.size() <= 50
+          && data.rootPartId is string
+          && data.rootPartId.size() <= 128
+          && data.updatedAt == request.time;
+      }
+      
+      match /savedBots/{botId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(botId) && isValidSavedBot(incoming()) && exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isOwner(userId) && isValidId(botId) && isValidSavedBotUpdate(incoming()) && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'parts', 'rootPartId', 'updatedAt']) && incoming().createdAt == existing().createdAt && incoming().userId == existing().userId && exists(/databases/$(database)/documents/users/$(userId));
+        allow delete: if isOwner(userId) && isValidId(botId);
+      }
+      
+      function isValidMatchHistory(data) {
+        return data.keys().hasAll(['userId', 'timestamp', 'playerBotName', 'opponentName', 'outcome', 'creditsEarned', 'playerHealthRemaining'])
+          && data.keys().size() == 7
+          && data.userId == request.auth.uid
+          && data.timestamp == request.time
+          && data.playerBotName is string
+          && data.playerBotName.size() <= 128
+          && data.opponentName is string
+          && data.opponentName.size() <= 128
+          && data.outcome is string
+          && data.outcome.size() <= 32
+          && data.creditsEarned is number
+          && data.playerHealthRemaining is number;
+      }
+      
+      match /matchHistory/{matchId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(matchId) && isValidMatchHistory(incoming()) && exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if false; // Match history should be immutable
+        allow delete: if isOwner(userId) && isValidId(matchId);
+      }
+    }
+  }
+}
