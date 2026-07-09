@@ -200,6 +200,7 @@ export default function App() {
           {/* SCREEN 1: Main Menu & Setup Dashboard */}
           {battleStatus === 'menu' && !isWorkshopOpen && (
             <motion.div
+              key="menu"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
@@ -820,6 +821,7 @@ export default function App() {
           {/* SCREEN 2: Dynamic CountDown Ring Overlay */}
           {battleStatus === 'countdown' && (
             <motion.div
+              key="countdown"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
@@ -845,7 +847,13 @@ export default function App() {
 
           {/* SCREEN 3: Active Battle View (HUD + Live Telemetry + Custom Mobile Overlay) */}
           {battleStatus === 'battle' && (
-            <>
+            <motion.div
+              key="battle"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-30 pointer-events-none"
+            >
               {/* Dynamic HUD */}
               <HUD botState={botState} />
 
@@ -863,12 +871,13 @@ export default function App() {
                   onOpenConfig={() => setIsConfigOpen(true)}
                 />
               </div>
-            </>
+            </motion.div>
           )}
 
           {/* SCREEN 4: Win/Loss Arena recap screen */}
           {battleStatus === 'ended' && (
             <motion.div
+              key="ended"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}

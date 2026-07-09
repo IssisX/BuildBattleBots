@@ -303,6 +303,11 @@ const Bot = ({
   const battleStatus = useGameStore(s => s.battleStatus);
   const settings = useGameStore(s => s.settings);
 
+  // Track previous forward speed and turning rates for realistic suspension lean physics
+  const lastSpeedForward = useRef(0);
+  const smoothedAccel = useRef(0);
+  const smoothedTurnRate = useRef(0);
+
   const actualColor = isPlayer ? paintScheme : "#FF003C";
   const actualWeaponType = isPlayer ? config.weapon.type : opponentConfig.weapon.type;
   const currentBotConfig = isPlayer ? config : opponentConfig;
@@ -513,7 +518,31 @@ const Bot = ({
       const dir = new THREE.Vector3(0, 0, -1).applyEuler(euler); const up = new THREE.Vector3(0, 1, 0).applyEuler(euler);
 
       const speedForward = linvel.x * dir.x + linvel.z * dir.z;
+      const turnRate = angvel.y;
       const posRaw = bodyRef.current.translation();
+      
+      // --- HIGH IMPACT PHYSICS UPGRADE 3: Dynamic Floor Scrapes ---
+      // If the bot tips too far, the chassis scrapes the floor violently causing sparks and dragging friction
+      if (Math.abs(euler.z) > 0.35 || Math.abs(euler.x) > 0.35) {
+         if (Math.abs(speedForward) > 3.0 && Math.random() < 0.25) {
+             useGameStore.getState().spawnSparks([posRaw.x, 0.05, posRaw.z], 3, '#FFAA00');
+             // Drag friction
+             bodyRef.current.applyImpulse({ x: -linvel.x * 0.15 * delta, y: 0, z: -linvel.z * 0.15 * delta }, true);
+         }
+      }
+      
+      // --- HIGH IMPACT PHYSICS UPGRADE 4: High-Speed Fishtail & Traction Loss ---
+      // When turning sharply at high speeds, the wheels break traction causing realistic drifting
+      if (Math.abs(speedForward) > 15.0 && Math.abs(turnRate) > 3.5) {
+         const driftAmount = (Math.abs(speedForward) - 15.0) * 0.05 * delta;
+         const rightDir = new THREE.Vector3(1, 0, 0).applyEuler(euler);
+         // Push the bot "out" of the turn
+         bodyRef.current.applyImpulse({ x: rightDir.x * Math.sign(turnRate) * driftAmount * 15.0, y: 0, z: rightDir.z * Math.sign(turnRate) * driftAmount * 15.0 }, true);
+         if (Math.random() < 0.15) {
+             useGameStore.getState().spawnSparks([posRaw.x, 0.05, posRaw.z], 1, '#888888'); // tire smoke/dust
+         }
+      }
+
       globalPhysicsState[isPlayer ? 'player' : 'opponent'].pos.set(posRaw.x, posRaw.y, posRaw.z);
       globalPhysicsState[isPlayer ? 'player' : 'opponent'].vel.set(linvel.x, linvel.y, linvel.z);
       globalPhysicsState[isPlayer ? 'player' : 'opponent'].mass = (currentBotConfig.armor.weight / 10) * settings.chassisMassScale;
@@ -557,8 +586,32 @@ const Bot = ({
            );
            visualRootRef.current.rotation.set(0,0,0);
         } else {
-           visualRootRef.current.position.lerp(new THREE.Vector3(0,0,0), 0.2);
-           visualRootRef.current.rotation.set(0,0,0);
+           // --- HIGH IMPACT PHYSICS UPGRADE 2: Chassis Weight Inertia & Suspension Lean Physics ---
+           // Calculate instantaneous forward acceleration
+           const accel = (speedForward - lastSpeedForward.current) / Math.max(0.001, finalDelta);
+           lastSpeedForward.current = speedForward;
+           
+           // Apply heavy smoothing to prevent raw physics jitter while keeping response ultra-snappy
+           smoothedAccel.current = THREE.MathUtils.lerp(smoothedAccel.current, accel, 0.12);
+           smoothedTurnRate.current = THREE.MathUtils.lerp(smoothedTurnRate.current, turnRate, 0.12);
+           
+           // Pitch: dip forward on hard braking/reverse, and rear back on forward acceleration
+           const targetPitch = THREE.MathUtils.clamp(-smoothedAccel.current * 0.0012 - speedForward * 0.003, -0.16, 0.16);
+           // Roll: lean outwards when carving high-speed turns
+           const targetRoll = THREE.MathUtils.clamp(-smoothedTurnRate.current * speedForward * 0.015, -0.14, 0.14);
+           // Dynamic suspension sink: lower the chassis slightly when subjected to heavy turn forces
+           const targetSuspensionY = THREE.MathUtils.clamp(-Math.abs(targetRoll) * 0.25 - Math.abs(targetPitch) * 0.15, -0.06, 0);
+           
+           const targetPos = new THREE.Vector3(0, targetSuspensionY, 0);
+           const targetRot = new THREE.Euler(targetPitch, 0, targetRoll);
+           
+           visualRootRef.current.position.lerp(targetPos, 0.2);
+           
+           // Blend visual rotation smoothly to reflect suspension changes
+           const currentQuat = new THREE.Quaternion().setFromEuler(visualRootRef.current.rotation);
+           const targetQuat = new THREE.Quaternion().setFromEuler(targetRot);
+           currentQuat.slerp(targetQuat, 0.2);
+           visualRootRef.current.rotation.setFromQuaternion(currentQuat);
         }
       }
 
@@ -586,8 +639,6 @@ const Bot = ({
          linvel.sub(rightDir.multiplyScalar(rightVel * dampAmount * 0.1));
          bodyRef.current.setLinvel(linvel, true);
       }
-
-      const turnRate = angvel.y;
 
       const leftSpin = (speedForward - turnRate * 0.9) / 0.42;
       const rightSpin = (speedForward + turnRate * 0.9) / 0.42;
@@ -691,6 +742,11 @@ const Bot = ({
 
       let wantToFire = false;
 
+      // Ensure bodies don't fall asleep while they are moving or waiting
+      if (bodyRef.current && typeof bodyRef.current.wakeUp === 'function') {
+        bodyRef.current.wakeUp();
+      }
+
       if (isPlayer) {
         const keyboardInput = get();
         const virtualInput = useGameStore.getState().virtualInput;
@@ -737,8 +793,8 @@ const Bot = ({
         const currentAngVel = bodyRef.current.angvel();
         if (analogX !== 0) {
             // Target turning velocity based on turning input, using maximumAngularVelocity as benchmark
-            // Scaling the target turning speed to be extremely comfortable and precise (max ~4.2 rad/s)
-            const turnFactor = 4.2;
+            // Scaling the target turning speed to be extremely comfortable and precise (max ~8.5 rad/s)
+            const turnFactor = 8.5;
             const targetAngVelY = -analogX * turnFactor;
             
             // Interpolate smoothly but instantly to target rotational velocity
@@ -937,6 +993,41 @@ const Bot = ({
                const glancingMult = className === 'direct' || className === 'heavy' || className === 'weapon' ? 1.0 : settings.glancingHitReduction;
                let baseDamage = energyDmgScale * dmgMult * glancingMult * settings.collisionBrutality * 0.1;
                baseDamage = Math.min(baseDamage, 1.5);
+
+               // --- HIGH IMPACT PHYSICS UPGRADE 1: Kinetic Collision Recoil & Rotational Instability ---
+               if (impactEnergy > 2 && bodyRef.current && targetRef.current) {
+                 // Scale impulse based on mass and speed
+                 const baseForce = Math.min(normalVelocity * 0.4, 10) * settings.impactImpulseScale;
+                 
+                 // Calculate directional force vectors
+                 const recoilDir = normalVec.clone().normalize();
+                 const pushX = recoilDir.x * baseForce;
+                 const pushZ = recoilDir.z * baseForce;
+                 
+                 // Determine vertical pop/lift (heavy hits or spinner hits pop bots into the air!)
+                 const liftForce = (className === 'heavy' || className === 'weapon') ? (Math.min(normalVelocity * 0.3, 5) * settings.impactImpulseScale) : 0;
+                 
+                 // Apply repulsive linear impulses to push bots apart realistically
+                 targetRef.current.applyImpulse({ x: pushX, y: liftForce, z: pushZ }, true);
+                 bodyRef.current.applyImpulse({ x: -pushX, y: liftForce * 0.2, z: -pushZ }, true);
+                 
+                 // Apply angular torque impulses to induce realistic spinout, roll, or tipping
+                 const torquePower = Math.min(normalVelocity * 1.5, 12) * settings.impactImpulseScale;
+                 
+                 // Defender wobbles, tips, and spins out violently
+                 targetRef.current.applyTorqueImpulse({
+                   x: (Math.random() - 0.5) * torquePower,
+                   y: (Math.random() > 0.5 ? 1 : -1) * torquePower * 1.5, // Yaw spinout
+                   z: (Math.random() - 0.5) * torquePower
+                 }, true);
+                 
+                 // Attacker experiences a minor reactive wobble/shudder
+                 bodyRef.current.applyTorqueImpulse({
+                   x: (Math.random() - 0.5) * torquePower * 0.4,
+                   y: -(Math.random() > 0.5 ? 1 : -1) * torquePower * 0.5,
+                   z: (Math.random() - 0.5) * torquePower * 0.4
+                 }, true);
+               }
                
                const components = otherId === 'player' ? useGameStore.getState().playerDamageComponents : useGameStore.getState().opponentDamageComponents;
                let hitZone = 'core';
@@ -2542,10 +2633,17 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
   const playerRef = useRef<any>(null);
   const opponentRef = useRef<any>(null);
   const targetObjRef = useRef<THREE.Object3D>(new THREE.Object3D());
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const battleStatus = useGameStore(s => s.battleStatus);
   const matchCount = useGameStore(s => s.matchCount);
   const settings = useGameStore(s => s.settings);
   const [debugPhysics, setDebugPhysics] = useState(false);
+
+  useEffect(() => {
+    if (battleStatus === 'battle' && wrapperRef.current) {
+      wrapperRef.current.focus();
+    }
+  }, [battleStatus]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -2559,7 +2657,7 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
   }, [debugPhysics]);
 
   return (
-    <div className="absolute inset-0 z-0 bg-[#121212]">
+    <div ref={wrapperRef} tabIndex={0} className="absolute inset-0 z-0 bg-[#121212] focus:outline-none">
       <Canvas shadows camera={{ position: [0, 12, 16], fov: 40 }}>
         <color attach="background" args={['#101112']} />
         
