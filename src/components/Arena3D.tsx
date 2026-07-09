@@ -3,10 +3,20 @@ import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls, Grid, Environment, ContactShadows, KeyboardControls, useKeyboardControls } from '@react-three/drei';
 import * as THREE from 'three';
 import { Physics, RigidBody, CuboidCollider, CylinderCollider } from '@react-three/rapier';
+import { DamageSystem } from "../combat/DamageSystem";
 import { useGameStore, CameraMode } from '../store';
 import { resolvePartTransforms, resolvePartTransformsV2, PART_TEMPLATES } from '../lib/partsCatalog';
 import { playImpactSound, initAudio } from '../lib/audio';
 import { ImpactEvent, ImpactClass, BotAnimState } from '../types';
+
+declare global {
+  interface Window {
+  }
+}
+
+
+
+
 export const globalPhysicsState = {
   player: { vel: new THREE.Vector3(), pos: new THREE.Vector3(), mass: 1, animState: "idle" as BotAnimState, lastHitTime: 0, hitNormal: new THREE.Vector3() },
   opponent: { vel: new THREE.Vector3(), pos: new THREE.Vector3(), mass: 1, animState: "idle" as BotAnimState, lastHitTime: 0, hitNormal: new THREE.Vector3() }
@@ -194,6 +204,63 @@ const CameraManager = ({
     </>
   );
 };
+
+const BotDamageVisuals = ({ botId }: { botId: string }) => {
+  const components = useGameStore(s => botId === 'player' ? s.playerDamageComponents : s.opponentDamageComponents);
+  
+  if (!components) return null;
+  
+  return (
+    <group>
+      {Object.values(components).map((comp) => {
+        if (!comp) return null;
+        if (comp.visualState === 'clean') return null;
+        
+        // Render simple decals or visual overlays based on state
+        const getOffset = () => {
+          switch(comp.hitZone) {
+            case 'front': return [0, 0.25, 0.9];
+            case 'rear': return [0, 0.25, -0.9];
+            case 'left': return [-0.75, 0.25, 0];
+            case 'right': return [0.75, 0.25, 0];
+            case 'top': return [0, 0.6, 0];
+            default: return [0, 0.25, 0];
+          }
+        };
+        
+        const offset = getOffset();
+        
+        return (
+          <group key={comp.componentId} position={offset as [number, number, number]}>
+            {comp.visualState === 'scuffed' && (
+              <mesh position={[0, 0.01, 0]}>
+                <planeGeometry args={[0.4, 0.4]} />
+                <meshBasicMaterial color="#333" transparent opacity={0.4} />
+              </mesh>
+            )}
+            {comp.visualState === 'dented' && (
+              <mesh position={[0, 0.01, 0]}>
+                <circleGeometry args={[0.3, 16]} />
+                <meshStandardMaterial color="#111" roughness={0.9} />
+              </mesh>
+            )}
+            {comp.visualState === 'exposed' && (
+              <mesh position={[0, 0.01, 0]}>
+                <planeGeometry args={[0.6, 0.4]} />
+                <meshStandardMaterial color="#555" roughness={0.5} metalness={0.8} />
+              </mesh>
+            )}
+            {comp.detached && (
+               // Render nothing if detached, could also spawn debris
+               null
+            )}
+          </group>
+        );
+      })}
+    </group>
+  );
+};
+
 const Bot = ({ 
   position, 
   color, 
@@ -242,51 +309,98 @@ const Bot = ({
   const isCustom = isPlayer && currentBotConfig.isCustom && currentBotConfig.parts && currentBotConfig.parts.length > 0;
   const resolvedParts = useMemo(() => isCustom && currentBotConfig.customConfig ? resolvePartTransformsV2(currentBotConfig.customConfig.parts, currentBotConfig.customConfig.rootPartId) : [], [isCustom, currentBotConfig.customConfig]);
 
+  const getPartFalloffThreshold = (instanceId: string, partType: string) => {
+    const hash = parseInt(instanceId.replace(/[^0-9a-f]/gi, '').slice(-4) || '8000', 16) / 65535;
+    const isVital = partType === 'chassis' || partType === 'wheel' || partType === 'weapon' || partType === 'motor';
+    return isVital ? 0.98 : 0.2 + hash * 0.7;
+  };
+
   // Elite Upgrades helper state and refs
   const overchargeHeatRef = useRef(0);
+  const damageComponents = useGameStore(s => isPlayer ? s.playerDamageComponents : s.opponentDamageComponents);
   const botHealth = useGameStore(s => isPlayer ? s.botState.health : s.opponentState.health);
   const damageFactor = 1.0 - botHealth / 100;
-  const hasBlownOff = useRef(false);
+  const detachedParts = useRef<Set<string>>(new Set());
   const addLog = useGameStore(s => s.addLog);
 
   useEffect(() => {
     if (battleStatus === 'countdown' || battleStatus === 'menu') {
-      hasBlownOff.current = false;
+      detachedParts.current.clear();
     }
   }, [battleStatus]);
 
   useEffect(() => {
-    if (actualWeaponType === 'drum' && botHealth < 45 && botHealth > 0 && !hasBlownOff.current) {
-      hasBlownOff.current = true;
-      addLog(`${isPlayer ? 'Player' : 'Opponent'} top deflection panel BLOWN OFF under heavy fire!`, 'critical');
-      if (bodyRef?.current) {
-        const pos = bodyRef.current.translation();
-        useGameStore.getState().spawnSparks([pos.x, pos.y + 0.5, pos.z], 18, '#FF5500');
-        useGameStore.getState().spawnDebris([pos.x, pos.y + 0.5, pos.z], 8);
+    if (botHealth <= 0) return;
+    
+    // Check Custom Bot Parts
+    if (isCustom && currentBotConfig.customConfig && currentBotConfig.customConfig.parts) {
+      resolvedParts.forEach(tr => {
+        const partDef = PART_TEMPLATES.find(p => p.templateId === tr.definitionId) as any;
+        if (!partDef) return;
+        const threshold = getPartFalloffThreshold(tr.instanceId, partDef.type || partDef.category || '');
+        if (damageFactor > threshold && !detachedParts.current.has(tr.instanceId)) {
+          detachedParts.current.add(tr.instanceId);
+          if (bodyRef?.current) {
+             const pos = bodyRef.current.translation();
+             useGameStore.getState().spawnSparks([pos.x, pos.y + 0.5, pos.z], 12, '#FFFFFF');
+             useGameStore.getState().spawnDebris([pos.x, pos.y + 0.5, pos.z], 5);
+          }
+        }
+      });
+    }
+
+    // Predefined Bot Parts
+    if (actualWeaponType === 'drum') {
+      if (damageFactor > 0.55 && !detachedParts.current.has('TopArmorDeflector')) {
+        detachedParts.current.add('TopArmorDeflector');
+        addLog(`${isPlayer ? 'Player' : 'Opponent'} top deflection panel BLOWN OFF under heavy fire!`, 'critical');
+        if (bodyRef?.current) {
+          const pos = bodyRef.current.translation();
+          useGameStore.getState().spawnSparks([pos.x, pos.y + 0.5, pos.z], 18, '#FF5500');
+          useGameStore.getState().spawnDebris([pos.x, pos.y + 0.5, pos.z], 8);
+        }
+      }
+      if (damageFactor > 0.75 && !detachedParts.current.has('LeftResponsiveArmor')) {
+        detachedParts.current.add('LeftResponsiveArmor');
+        addLog(`${isPlayer ? 'Player' : 'Opponent'} left armor shattered!`, 'warning');
+        if (bodyRef?.current) {
+          const pos = bodyRef.current.translation();
+          useGameStore.getState().spawnDebris([pos.x, pos.y + 0.5, pos.z], 6);
+        }
+      }
+      if (damageFactor > 0.85 && !detachedParts.current.has('RightResponsiveArmor')) {
+        detachedParts.current.add('RightResponsiveArmor');
+        addLog(`${isPlayer ? 'Player' : 'Opponent'} right armor shattered!`, 'warning');
+        if (bodyRef?.current) {
+          const pos = bodyRef.current.translation();
+          useGameStore.getState().spawnDebris([pos.x, pos.y + 0.5, pos.z], 6);
+        }
       }
     }
-  }, [botHealth, actualWeaponType, isPlayer, addLog, bodyRef]);
+  }, [botHealth, damageFactor, actualWeaponType, isPlayer, addLog, bodyRef, isCustom, currentBotConfig, resolvedParts]);
 
   useFrame((state, delta) => {
-    if (cooldownRef.current > 0) cooldownRef.current -= delta;
-    if (fireAnimRef.current > 0) fireAnimRef.current -= delta * 5; // Animate over 0.2 seconds
+    const finalDelta = delta;
+
+    if (cooldownRef.current > 0) cooldownRef.current -= finalDelta;
+    if (fireAnimRef.current > 0) fireAnimRef.current -= finalDelta * 5; // Animate over 0.2 seconds
 
     if (weaponRef.current) {
       if (actualWeaponType === 'spinner' || actualWeaponType === 'saw') {
         const targetRPM = isSpinning ? currentBotConfig.weapon.rpm / 100 : 0;
         const acceleration = isSpinning ? 5.0 : 2.0; // Spool up vs spin down
-        currentRPM.current = THREE.MathUtils.lerp(currentRPM.current, targetRPM, delta * acceleration);
-        weaponRef.current.rotation.y -= currentRPM.current * delta * 15; // Spin horizontally
+        currentRPM.current = THREE.MathUtils.lerp(currentRPM.current, targetRPM, finalDelta * acceleration);
+        weaponRef.current.rotation.y -= currentRPM.current * finalDelta * 15; // Spin horizontally
       } else if (actualWeaponType === 'drum') {
         const targetRPM = isSpinning ? currentBotConfig.weapon.rpm / 100 : 0;
         const acceleration = isSpinning ? 6.0 : 3.0; 
-        currentRPM.current = THREE.MathUtils.lerp(currentRPM.current, targetRPM, delta * acceleration);
-        weaponRef.current.rotation.x -= currentRPM.current * delta * 25; // Spin vertically
+        currentRPM.current = THREE.MathUtils.lerp(currentRPM.current, targetRPM, finalDelta * acceleration);
+        weaponRef.current.rotation.x -= currentRPM.current * finalDelta * 25; // Spin vertically
 
         // Elite Upgrade 3: Weapon Overcharge Thermals & Glow (R3F efficiency with refs)
-        const targetHeat = isSpinning ? Math.min(1.0, Math.abs(currentRPM.current) / (currentBotConfig.weapon.rpm / 100)) : 0.0;
+        const targetHeat = isSpinning ? Math.min(1.0, Math.abs(currentRPM.current) / currentBotConfig.weapon.rpm) : 0.0;
         const lerpSpeed = isSpinning ? 0.35 : 1.0;
-        overchargeHeatRef.current = THREE.MathUtils.lerp(overchargeHeatRef.current, targetHeat, delta * lerpSpeed);
+        overchargeHeatRef.current = THREE.MathUtils.lerp(overchargeHeatRef.current, targetHeat, finalDelta * lerpSpeed);
         
         weaponRef.current.traverse((child) => {
           if (child instanceof THREE.Mesh) {
@@ -321,8 +435,8 @@ const Bot = ({
         const k = 600; // Super stiff spring for sudden punchy launch
         const d = 18;  // Perfectly damped
         const force = -k * (flipperPos.current - targetExtension) - d * flipperVel.current;
-        flipperVel.current += force * delta;
-        flipperPos.current += flipperVel.current * delta;
+        flipperVel.current += force * finalDelta;
+        flipperPos.current += flipperVel.current * finalDelta;
 
         if (flipperPos.current < 0) {
           flipperPos.current = 0;
@@ -391,13 +505,14 @@ const Bot = ({
       // Rotate wheels based on linear/angular velocity for high fidelity skid-steering
       const linvelRaw = bodyRef.current.linvel();
       const linvel = new THREE.Vector3(linvelRaw.x, linvelRaw.y, linvelRaw.z);
-      const currentRotation = bodyRef.current.rotation();
-      const euler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(currentRotation.x, currentRotation.y, currentRotation.z, currentRotation.w));
-      const dir = new THREE.Vector3(0, 0, -1).applyEuler(euler);
-
-      const speedForward = linvel.x * dir.x + linvel.z * dir.z;
       const angvelRaw = bodyRef.current.angvel();
       const angvel = new THREE.Vector3(angvelRaw.x, angvelRaw.y, angvelRaw.z);
+
+      const currentRotation = bodyRef.current.rotation();
+      const euler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(currentRotation.x, currentRotation.y, currentRotation.z, currentRotation.w));
+      const dir = new THREE.Vector3(0, 0, -1).applyEuler(euler); const up = new THREE.Vector3(0, 1, 0).applyEuler(euler);
+
+      const speedForward = linvel.x * dir.x + linvel.z * dir.z;
       const posRaw = bodyRef.current.translation();
       globalPhysicsState[isPlayer ? 'player' : 'opponent'].pos.set(posRaw.x, posRaw.y, posRaw.z);
       globalPhysicsState[isPlayer ? 'player' : 'opponent'].vel.set(linvel.x, linvel.y, linvel.z);
@@ -477,10 +592,10 @@ const Bot = ({
       const leftSpin = (speedForward - turnRate * 0.9) / 0.42;
       const rightSpin = (speedForward + turnRate * 0.9) / 0.42;
 
-      if (frontRightWheelRef.current) frontRightWheelRef.current.rotation.x -= rightSpin * delta;
-      if (backRightWheelRef.current) backRightWheelRef.current.rotation.x -= rightSpin * delta;
-      if (frontLeftWheelRef.current) frontLeftWheelRef.current.rotation.x -= leftSpin * delta;
-      if (backLeftWheelRef.current) backLeftWheelRef.current.rotation.x -= leftSpin * delta;
+      if (frontRightWheelRef.current) frontRightWheelRef.current.rotation.x -= rightSpin * finalDelta;
+      if (backRightWheelRef.current) backRightWheelRef.current.rotation.x -= rightSpin * finalDelta;
+      if (frontLeftWheelRef.current) frontLeftWheelRef.current.rotation.x -= leftSpin * finalDelta;
+      if (backLeftWheelRef.current) backLeftWheelRef.current.rotation.x -= leftSpin * finalDelta;
 
       if (isCustom && currentBotConfig.parts) {
         currentBotConfig.parts.forEach(part => {
@@ -491,14 +606,17 @@ const Bot = ({
             if (pType === 'wheel') {
               const isLeft = ((part as any).position?.[0] || (part as any).localPosition?.[0]) < 0;
               const spin = isLeft ? leftSpin : rightSpin;
-              // Rotate first child (which is the cylinder wheel group) about its local spin axis
-              if (meshGroup.children[0]) {
-                meshGroup.children[0].rotation.y -= spin * delta;
-              }
+              // Rotate the entire part group around its local X axis (which points left/right in world space)
+              meshGroup.rotation.x -= spin * finalDelta;
             } else if (pType === 'weapon') {
               const wType = currentBotConfig.weapon.type;
-              if (wType === 'spinner' || wType === 'saw' || wType === 'drum') {
-                meshGroup.rotation.y -= currentRPM.current * delta * 0.05;
+              if (partDef?.templateId === 'weapon_drum') {
+                const drumSpinner = meshGroup.getObjectByName('DrumSpinner');
+                if (drumSpinner) {
+                  drumSpinner.rotation.x -= currentRPM.current * finalDelta * 15;
+                }
+              } else if (wType === 'spinner' || wType === 'saw' || wType === 'drum') {
+                meshGroup.rotation.y -= currentRPM.current * finalDelta * 0.05;
               } else if (wType === 'flipper') {
                 meshGroup.rotation.x = flipperPos.current * 0.9;
               } else if (wType === 'hammer') {
@@ -534,16 +652,18 @@ const Bot = ({
       const myPos = bodyRef.current.translation();
       const currentRotation = bodyRef.current.rotation();
       const euler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(currentRotation.x, currentRotation.y, currentRotation.z, currentRotation.w));
-      const dir = new THREE.Vector3(0, 0, -1).applyEuler(euler);
+      const dir = new THREE.Vector3(0, 0, -1).applyEuler(euler); const up = new THREE.Vector3(0, 1, 0).applyEuler(euler);
 
       // Robust Stuck State Detection & Resolution
       const currentPos = new THREE.Vector3(myPos.x, myPos.y, myPos.z);
+      // AI always counts as trying to move forward if it's far enough
       const isInputActive = isPlayer 
-        ? (get().forward || get().backward || get().left || get().right || useGameStore.getState().virtualInput.forward || useGameStore.getState().virtualInput.backward) 
-        : true;
+        ? (get().forward || get().backward || useGameStore.getState().virtualInput.forward || useGameStore.getState().virtualInput.backward) 
+        : (targetRef?.current && currentPos.distanceTo(targetRef.current.translation()) > 0.6);
       
       const posDiff = currentPos.distanceTo(lastPos.current);
-      if (isInputActive && posDiff < 0.03) {
+      // Only increment stuck timer if actively trying to move linearly but failing to move
+      if (isInputActive && posDiff < 0.015) {
         stuckTimer.current += delta;
       } else {
         stuckTimer.current = 0;
@@ -563,7 +683,7 @@ const Bot = ({
           useGameStore.getState().addLog(`Boundary hazard recovery activated for ${isPlayer ? 'Player' : 'Opponent'}.`, 'info');
         } else {
           const centerDir = new THREE.Vector3(0 - currentPos.x, 0, 0 - currentPos.z).normalize();
-          bodyRef.current.applyImpulse({ x: centerDir.x * 25, y: 18, z: centerDir.z * 25 }, true);
+          bodyRef.current.applyImpulse({ x: centerDir.x * 10, y: 3, z: centerDir.z * 10 }, true);
           bodyRef.current.applyTorqueImpulse({ x: 1, y: 3, z: 1 }, true);
           useGameStore.getState().addLog(`Stuck lock resolved for ${isPlayer ? 'Player' : 'Opponent'}.`, 'info');
         }
@@ -580,8 +700,13 @@ const Bot = ({
         const right = keyboardInput.right || virtualInput.right;
 
         // Auto-righting if flipped
-        if (dir.y < -0.5) {
-          bodyRef.current.applyTorqueImpulse({ x: 2, y: 0, z: 2 }, true);
+        if (up.y < 0.8) {
+          const rightingAxis = new THREE.Vector3().crossVectors(up, new THREE.Vector3(0, 1, 0)).normalize();
+          const rightingStrength = (1.0 - up.y) * 8.0 * (config.armor.weight / 100) * delta * 120;
+          bodyRef.current.applyTorqueImpulse({ x: rightingAxis.x * rightingStrength, y: 0, z: rightingAxis.z * rightingStrength }, true);
+          if (up.y < 0.0 && myPos.y < 1.0) {
+             bodyRef.current.applyImpulse({ x: 0, y: 15.0 * (config.armor.weight / 100) * delta, z: 0 }, true);
+          }
         }
 
         const speed = config.motor.maxSpeed * 0.45 * 1.0;
@@ -593,12 +718,42 @@ const Bot = ({
         const analogX = analogX_val !== 0 ? analogX_val : (left ? -1 : right ? 1 : 0);
 
         if (analogY !== 0) {
-            bodyRef.current.applyImpulse({ x: -dir.x * analogY * speed * delta * 10, y: 0, z: -dir.z * analogY * speed * delta * 10 }, true);
+            bodyRef.current.applyImpulse({ x: -dir.x * analogY * speed * delta * 15, y: 0, z: -dir.z * analogY * speed * delta * 15 }, true);
+        } else {
+            // Apply forward/backward linear braking to make controls super sharp and responsive
+            const currentLinVel = bodyRef.current.linvel();
+            const forwardVel = dir.dot(new THREE.Vector3(currentLinVel.x, currentLinVel.y, currentLinVel.z));
+            if (Math.abs(forwardVel) > 0.05) {
+               const brakeForce = dir.clone().multiplyScalar(-forwardVel * 0.12);
+               bodyRef.current.setLinvel({
+                 x: currentLinVel.x + brakeForce.x,
+                 y: currentLinVel.y,
+                 z: currentLinVel.z + brakeForce.z
+               }, true);
+            }
         }
         
+        // High quality directional controls with active rotational dampening
+        const currentAngVel = bodyRef.current.angvel();
         if (analogX !== 0) {
-            const curvedX = Math.sign(analogX) * Math.pow(Math.abs(analogX), 2);
-            bodyRef.current.applyTorqueImpulse({ x: 0, y: -curvedX * torque * delta * 10, z: 0 }, true);
+            // Target turning velocity based on turning input, using maximumAngularVelocity as benchmark
+            // Scaling the target turning speed to be extremely comfortable and precise (max ~4.2 rad/s)
+            const turnFactor = 4.2;
+            const targetAngVelY = -analogX * turnFactor;
+            
+            // Interpolate smoothly but instantly to target rotational velocity
+            bodyRef.current.setAngvel({
+              x: currentAngVel.x,
+              y: currentAngVel.y + (targetAngVelY - currentAngVel.y) * 0.35,
+              z: currentAngVel.z
+            }, true);
+        } else {
+            // Heavy rotational braking when no steering input is applied - stops the "million mph 360" effect!
+            bodyRef.current.setAngvel({
+              x: currentAngVel.x,
+              y: currentAngVel.y * 0.72,
+              z: currentAngVel.z
+            }, true);
         }
         
         wantToFire = (keyboardInput.jump || virtualInput.action) && (actualWeaponType === 'flipper' || actualWeaponType === 'hammer' || actualWeaponType === 'crusher');
@@ -611,24 +766,44 @@ const Bot = ({
         const dot = dir.x * (dx/dist) + dir.z * (dz/dist);
         
         // Auto-righting if flipped
-        if (dir.y < -0.5) {
-          bodyRef.current.applyTorqueImpulse({ x: 2, y: 0, z: 2 }, true);
+        if (up.y < 0.8) {
+          const rightingAxis = new THREE.Vector3().crossVectors(up, new THREE.Vector3(0, 1, 0)).normalize();
+          const rightingStrength = (1.0 - up.y) * 8.0 * (opponentConfig.armor.weight / 100) * delta * 120;
+          bodyRef.current.applyTorqueImpulse({ x: rightingAxis.x * rightingStrength, y: 0, z: rightingAxis.z * rightingStrength }, true);
+          if (up.y < 0.0 && myPos.y < 1.0) {
+             bodyRef.current.applyImpulse({ x: 0, y: 15.0 * (opponentConfig.armor.weight / 100) * delta, z: 0 }, true);
+          }
         }
 
-        if (dist > 1.2) {
-          const speed = opponentConfig.motor.maxSpeed * 0.35 * 1.0;
+        if (dist > 0.4) {
+          const speed = opponentConfig.motor.maxSpeed * 0.45 * 1.0;
           const nx = dx / dist;
           const nz = dz / dist;
           
-          if (dot > 0) {
-            bodyRef.current.applyImpulse({ x: nx * speed * delta * 10, y: 0, z: nz * speed * delta * 10 }, true);
+          // Drive forward if roughly facing the target
+          if (dot > 0.4) {
+            // Apply impulse along the robot's forward vector (dir) proportional to how directly it's facing the player
+            // Dampen speed significantly to prevent "shooting across the map"
+            const driveFactor = Math.max(0, dot);
+            bodyRef.current.applyImpulse({ x: dir.x * speed * delta * 5.0 * driveFactor, y: 0, z: dir.z * speed * delta * 5.0 * driveFactor }, true);
           }
           
-          const targetAngle = Math.atan2(dx, dz);
-          bodyRef.current.setRotation({ x: 0, y: Math.sin(targetAngle / 2), z: 0, w: Math.cos(targetAngle / 2) }, true);
+          // Smoothly steer towards the player using torque instead of forcefully setting rotation
+          const targetAngle = Math.atan2(nx, nz);
+          // Get current yaw (approximate from direction vector)
+          const currentYaw = Math.atan2(dir.x, dir.z);
+          
+          // Smallest angle difference
+          let angleDiff = targetAngle - currentYaw;
+          while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+          while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+          
+          // Apply torque proportional to the angle difference
+          const torqueAmt = angleDiff * opponentConfig.motor.torque * delta * 0.08; 
+          bodyRef.current.applyTorqueImpulse({ x: 0, y: torqueAmt, z: 0 }, true);
         }
         
-        if (dist < 2.5 && dot > 0.8 && (actualWeaponType === 'flipper' || actualWeaponType === 'hammer' || actualWeaponType === 'crusher')) {
+        if (dist < 1.8 && dot > 0.8 && (actualWeaponType === 'flipper' || actualWeaponType === 'hammer' || actualWeaponType === 'crusher')) {
             wantToFire = true;
         }
       }
@@ -644,26 +819,29 @@ const Bot = ({
              const dist = Math.sqrt(dx * dx + dz * dz);
              const dot = dir.x * (dx/dist) + dir.z * (dz/dist);
              
-             if (dist < 2.5 && dot > 0.5) {
+             // Dynamic effective range: hammers can reach further, crushers/flippers need to be tight
+             const effectiveRange = actualWeaponType === 'hammer' ? 2.2 : 1.7;
+             
+             if (dist < effectiveRange && dot > 0.7) {
                  const damageBase = currentBotConfig.weapon.damage;
-                 const finalDamage = damageBase * 0.3; 
-                 damageBot(isPlayer ? 'opponent' : 'player', finalDamage);
+                 const finalDamage = damageBase * 0.15; 
+                 damageBot(isPlayer ? 'opponent' : 'player', finalDamage); if (finalDamage > 2.0) { useGameStore.getState().addLog(`🔨 DEVASTATING! ${actualWeaponType.toUpperCase()} struck a critical blow!`, 'combat'); }
                  
                  const impactVector = [dir.x * 15 * settings.impactImpulseScale, 10 * settings.impactImpulseScale, dir.z * 15 * settings.impactImpulseScale] as [number, number, number];
-                 useGameStore.getState().spawnDebris([targetPos.x, targetPos.y, targetPos.z], finalDamage * 1.5, impactVector);
-                 useGameStore.getState().spawnSparks([targetPos.x, targetPos.y, targetPos.z], Math.floor(finalDamage), actualWeaponType === 'hammer' ? '#FFD700' : '#FFFFFF');
+                 useGameStore.getState().spawnDebris([targetPos.x, targetPos.y, targetPos.z], finalDamage * 8.0, impactVector);
+                 useGameStore.getState().spawnSparks([targetPos.x, targetPos.y, targetPos.z], Math.floor(finalDamage * 4), actualWeaponType === 'hammer' ? '#FFD700' : '#FFFFFF');
                  
                  const oppWeightMult = (isPlayer ? opponentConfig.armor.weight : config.armor.weight) / 100;
 
                  if (actualWeaponType === 'flipper') {
-                     targetRef.current.applyImpulse({ x: dir.x * 200 * settings.impactImpulseScale / oppWeightMult, y: 350 * settings.impactImpulseScale / oppWeightMult, z: dir.z * 200 * settings.impactImpulseScale / oppWeightMult }, true);
-                     targetRef.current.applyTorqueImpulse({ x: (Math.random() - 0.5) * 100 * settings.impactImpulseScale, y: (Math.random() - 0.5) * 100 * settings.impactImpulseScale, z: (Math.random() - 0.5) * 100 * settings.impactImpulseScale }, true);
-                     bodyRef.current.applyImpulse({ x: -dir.x * 50 * 1.0, y: -50 * 1.0, z: -dir.z * 50 * 1.0 }, true); 
+                     targetRef.current.applyImpulse({ x: dir.x * 15 * settings.impactImpulseScale / oppWeightMult, y: 20 * settings.impactImpulseScale / oppWeightMult, z: dir.z * 15 * settings.impactImpulseScale / oppWeightMult }, true);
+                     targetRef.current.applyTorqueImpulse({ x: (Math.random() - 0.5) * 20 * settings.impactImpulseScale, y: (Math.random() - 0.5) * 20 * settings.impactImpulseScale, z: (Math.random() - 0.5) * 20 * settings.impactImpulseScale }, true);
+                     bodyRef.current.applyImpulse({ x: -dir.x * 15 * 1.0, y: -10 * 1.0, z: -dir.z * 15 * 1.0 }, true); 
                  } else if (actualWeaponType === 'hammer') {
-                     targetRef.current.applyImpulse({ x: 0, y: -300 * settings.impactImpulseScale / oppWeightMult, z: 0 }, true);
-                     bodyRef.current.applyImpulse({ x: 0, y: 150 * 1.0, z: 0 }, true); 
+                     targetRef.current.applyImpulse({ x: 0, y: -60 * settings.impactImpulseScale / oppWeightMult, z: 0 }, true);
+                     bodyRef.current.applyImpulse({ x: 0, y: 30 * 1.0, z: 0 }, true); 
                  } else if (actualWeaponType === 'crusher') {
-                     targetRef.current.applyImpulse({ x: -dir.x * 100 * settings.impactImpulseScale / oppWeightMult, y: -200 * settings.impactImpulseScale / oppWeightMult, z: -dir.z * 100 * settings.impactImpulseScale / oppWeightMult }, true);
+                     targetRef.current.applyImpulse({ x: -dir.x * 20 * settings.impactImpulseScale / oppWeightMult, y: -40 * settings.impactImpulseScale / oppWeightMult, z: -dir.z * 20 * settings.impactImpulseScale / oppWeightMult }, true);
                  }
              }
           }
@@ -678,7 +856,7 @@ const Bot = ({
     <>
       <group ref={meshRef} position={position} />
       
-      <RigidBody 
+      <RigidBody ccd={true} 
         ref={bodyRef} 
         position={position} 
         colliders={false} 
@@ -689,6 +867,21 @@ const Bot = ({
         enabledRotations={[true, true, true]}
         canSleep={false}
         userData={{ id: isPlayer ? 'player' : 'opponent' }}
+        onContactForce={(e) => {
+           if (battleStatus !== 'battle') return;
+           const force = e.totalForceMagnitude;
+           if (force > 500) {
+             const now = Date.now();
+             if (now - lastHitTime.current < 250) return;
+             // High sustained contact force detected
+             const detail = {
+                 type: 'force',
+                 force: force,
+                 attacker: isPlayer ? 'player' : 'opponent'
+             };
+             window.dispatchEvent(new CustomEvent('combat-impact', { detail }));
+           }
+        }}
         onCollisionEnter={({ other }) => {
           if (battleStatus !== 'battle') return;
           const otherId = other.rigidBodyObject?.userData?.id;
@@ -742,10 +935,57 @@ const Bot = ({
                const energyDmgScale = Math.min(impactEnergy * 0.05, 50);
                const dmgMult = settings.damageMultiplier;
                const glancingMult = className === 'direct' || className === 'heavy' || className === 'weapon' ? 1.0 : settings.glancingHitReduction;
-               let baseDamage = energyDmgScale * dmgMult * glancingMult * settings.collisionBrutality;
-               baseDamage = Math.min(baseDamage, 60);
+               let baseDamage = energyDmgScale * dmgMult * glancingMult * settings.collisionBrutality * 0.1;
+               baseDamage = Math.min(baseDamage, 1.5);
                
-               const event: ImpactEvent = {
+               const components = otherId === 'player' ? useGameStore.getState().playerDamageComponents : useGameStore.getState().opponentDamageComponents;
+               let hitZone = 'core';
+               if (Math.abs(contactPoint[0]) > Math.abs(contactPoint[2])) {
+                 hitZone = contactPoint[0] > 0 ? 'right' : 'left';
+               } else {
+                 hitZone = contactPoint[2] > 0 ? 'front' : 'rear';
+               }
+               if (contactPoint[1] > 0.5) hitZone = 'top';
+               
+               window.dispatchEvent(new CustomEvent('combat-impact', {
+                 detail: {
+                   type: 'collision',
+                   className,
+                   impactEnergy,
+                   damageAmount: baseDamage,
+                   position: contactPoint,
+                   attacker: config.name,
+                   defender: opponentConfig.name,
+                   hitZone
+                 }
+               }));
+               
+               const wasDetached = components[hitZone]?.detached;
+               const targetComp = components[hitZone];
+
+               const damageEvent = DamageSystem.processImpact(
+                 now,
+                 myId,
+                 otherId,
+                 normalVelocity,
+                 tangentialVelocity,
+                 impulse,
+                 contactPoint,
+                 normal,
+                 [0, 0, 0], // tangent estimation
+                 className === 'weapon' ? 'weapon' : 'body',
+                 targetComp
+               );
+               
+               if (targetComp && !wasDetached && targetComp.detached) { 
+                 useGameStore.getState().addLog(`${isPlayer ? "Opponent" : "Player"} ${hitZone} component DESTROYED!`, "critical"); 
+                 useGameStore.getState().spawnSparks([contactPoint[0], contactPoint[1] + 0.2, contactPoint[2]], 40, "#FF3300"); 
+                 useGameStore.getState().spawnDebris([contactPoint[0], contactPoint[1] + 0.2, contactPoint[2]], 15); 
+               }
+               if (damageEvent) damageEvent.damageAmount = baseDamage;
+               useGameStore.getState().processImpactEvent(damageEvent);
+
+               const event = {
                  id: 'impact_' + now,
                  time: now,
                  className,
@@ -764,7 +1004,12 @@ const Bot = ({
                  weaponSpin: useGameStore.getState().botState.weaponActive && config.weapon ? config.weapon.rpm : 0,
                  damageAmount: baseDamage,
                  confidence: 1.0
-               };
+               } as any;
+               if (baseDamage > 2.0) {
+                 useGameStore.getState().addLog(`💥 MAJOR HIT! Kinetic impact delivered massive force to ${otherId}.`, 'combat');
+               } else if (baseDamage > 0.8 && className === 'glancing') {
+                 useGameStore.getState().addLog(`🛡️ Glancing blow deflected by ${otherId}'s armor.`, 'combat');
+               }
                
                // Trigger Sound
                playImpactSound(event);
@@ -784,41 +1029,41 @@ const Bot = ({
                else if (className === 'weapon') oppState.animState = 'weaponContact';
                else oppState.animState = 'hitReact';
                
-               // Apply artificial knockback based on event.impulse to accentuate the hit
-               if (settings.knockbackScale !== 1.0) {
-                 const knockbackMag = Math.min(event.impulse * 0.5 * settings.knockbackScale, 200); 
-                 if (knockbackMag > 5) {
-                   const oppToMyDir = new THREE.Vector3().subVectors(myState.vel, oppState.vel).normalize();
-                   bodyRef.current?.applyImpulse(oppToMyDir.clone().multiplyScalar(knockbackMag), true);
-                 }
-               }
-               
                if (baseDamage > 2) {
                  useGameStore.getState().damageBot('player', baseDamage * 0.5);
                  useGameStore.getState().damageBot('opponent', baseDamage * 0.5);
                }
                  
                // Spawn effects
-               const finalAmount = Math.min(className === 'heavy' || className === 'weapon' ? 20 : 5, settings.maxActiveFragments);
+               const finalAmount = className === 'heavy' || className === 'weapon' ? 100 : 30;
                useGameStore.getState().spawnSparks([contactPoint[0], contactPoint[1] + 0.2, contactPoint[2]], finalAmount);
                if (className === 'heavy' && !settings.performanceMode) {
                  useGameStore.getState().spawnDebris([contactPoint[0], contactPoint[1] + 0.2, contactPoint[2]], finalAmount / 2);
                  window.dispatchEvent(new CustomEvent('spawn-shockwave', { detail: { position: [contactPoint[0], 0.05, contactPoint[2]] } }));
                }
 
+               // Removed cinematic slow mo
             }
           }
         }}
       >
         {!isCustom ? (
           <>
-            <CuboidCollider args={[0.75, 0.3, 1]} position={[0, 0.4, 0]} restitution={settings.collisionRestitution} friction={0.2} />
-            <CuboidCollider args={[0.75, 0.1, 0.4]} position={[0, 0.2, -1.2]} rotation={[0.2, 0, 0]} restitution={settings.collisionRestitution} friction={0.2} />
+            {/* Core Chassis */}
+            <CuboidCollider args={[0.55, 0.25, 0.8]} position={[0, 0.35, 0]} restitution={settings.collisionRestitution} friction={0.4} />
+            {/* Front Wedge */}
+            <CuboidCollider args={[0.7, 0.1, 0.4]} position={[0, 0.18, -1.1]} rotation={[0.3, 0, 0]} restitution={settings.collisionRestitution} friction={0.1} />
+            {/* Left Armor */}
+            <CuboidCollider args={[0.1, 0.25, 0.7]} position={[-0.65, 0.35, 0]} restitution={settings.collisionRestitution} friction={0.4} />
+            {/* Right Armor */}
+            <CuboidCollider args={[0.1, 0.25, 0.7]} position={[0.65, 0.35, 0]} restitution={settings.collisionRestitution} friction={0.4} />
           </>
         ) : (
           resolvedParts.map((tr) => {
             const partDef = PART_TEMPLATES.find(p => p.templateId === tr.definitionId) as any;
-            
+            const threshold = getPartFalloffThreshold(tr.instanceId, partDef?.type || '');
+            if (damageFactor > threshold) return null;
+
             if (partDef && partDef.colliders && partDef.colliders.length > 0) {
               return (
                 <group key={tr.instanceId} position={tr.world.position} rotation={tr.world.rotation}>
@@ -838,7 +1083,7 @@ const Bot = ({
                       return (
                         <CylinderCollider 
                           key={`${tr.instanceId}-${idx}`}
-                          args={[col.dimensions[0], col.dimensions[1]]} 
+                          args={[col.dimensions[0] / 2, col.dimensions[1]]} 
                           position={col.localPosition}
                           rotation={col.localRotation}
                           restitution={settings.collisionRestitution} friction={0.2} 
@@ -849,7 +1094,7 @@ const Bot = ({
                       return (
                         <CylinderCollider 
                           key={`${tr.instanceId}-${idx}`}
-                          args={[col.dimensions[0], col.dimensions[1]]} 
+                          args={[col.dimensions[0] / 2, col.dimensions[1]]} 
                           position={col.localPosition}
                           rotation={col.localRotation}
                           restitution={settings.collisionRestitution} friction={0.2} 
@@ -867,12 +1112,17 @@ const Bot = ({
         )}
         
         <group ref={visualRootRef}>
+          <BotDamageVisuals botId={isPlayer ? "player" : "opponent"} />
         {isCustom && currentBotConfig.customConfig && currentBotConfig.customConfig.parts && (
           <group position={[0, 0, 0]}>
             {resolvedParts.map((tr) => {
               const part = currentBotConfig.customConfig.parts.find(p => p.instanceId === tr.instanceId)!;
               const partDef = PART_TEMPLATES.find(p => p.templateId === tr.definitionId) as any;
               if (!part || !partDef) return null;
+              
+              const threshold = getPartFalloffThreshold(tr.instanceId, partDef.type || partDef.category || '');
+              if (damageFactor > threshold) return null;
+
               const [w, h, d] = partDef.dimensions || partDef.size || [0.5,0.5,0.5];
               const color = part.color || partDef.color || '#fff';
               const visualKind = partDef.visualKind;
@@ -893,7 +1143,7 @@ const Bot = ({
                       </mesh>
                     )}
                     {visualKind === 'cylinder' && (
-                      <group rotation={pType === 'wheel' ? [0, 0, Math.PI / 2] : [0, 0, 0]}>
+                      <group name="WheelSpinGroup" rotation={pType === 'wheel' ? [0, 0, Math.PI / 2] : [0, 0, 0]}>
                         <mesh castShadow receiveShadow>
                           <cylinderGeometry args={[w, h, d, 16]} />
                           <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
@@ -960,7 +1210,7 @@ const Bot = ({
         {!isCustom && (
           <group position={[0, 0.4, 0]}>
           {/* Main body rear (rendered for non-drum bots, as drum bot has a layered modular assembly) */}
-          {actualWeaponType !== 'drum' && (
+          {actualWeaponType !== 'drum' && damageComponents?.rear?.visualState !== 'detached' && (
             <mesh castShadow receiveShadow position={[0, 0, 0.25]}>
               <boxGeometry args={[1.5, 0.4, 1.5]} />
               <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.2} />
@@ -968,14 +1218,14 @@ const Bot = ({
           )}
           
           {/* Weapon-specific customized front chassis plates (eliminates overlapping flipper scoop issues) */}
-          {actualWeaponType === 'hammer' && (
+          {actualWeaponType === 'hammer' && damageComponents?.front?.visualState !== 'detached' && (
             <mesh castShadow receiveShadow position={[0, -0.05, -0.85]} rotation={[0.25, 0, 0]}>
               <boxGeometry args={[1.5, 0.1, 1.2]} />
               <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.2} />
             </mesh>
           )}
 
-          {(actualWeaponType === 'spinner' || actualWeaponType === 'saw') && (
+          {(actualWeaponType === 'spinner' || actualWeaponType === 'saw') && damageComponents?.front?.visualState !== 'detached' && (
             <>
               {/* Corner split protective bumpers (leaves center 100% clear for spinning blade clearances) */}
               <mesh castShadow receiveShadow position={[-0.6, -0.05, -0.85]} rotation={[0.25, 0.1, 0]}>
@@ -1046,38 +1296,42 @@ const Bot = ({
               )}
 
               {/* Left Side Armor plate sags & deforms as health drops */}
-              <group 
-                name="LeftResponsiveArmor"
-                position={[-0.78, damageFactor > 0.3 ? -damageFactor * 0.12 : 0, 0.25]}
-                rotation={[0, 0, damageFactor > 0.3 ? -damageFactor * 0.25 : 0]}
-              >
-                <mesh castShadow receiveShadow>
-                  <boxGeometry args={[0.08, 0.36, 1.35]} />
-                  <meshStandardMaterial 
-                    color="#252525" 
-                    metalness={0.95} 
-                    roughness={0.3} 
-                    emissive={damageFactor > 0.4 ? "#3d1100" : "#000000"}
-                  />
-                </mesh>
-              </group>
+              {damageFactor <= 0.75 && (
+                <group 
+                  name="LeftResponsiveArmor"
+                  position={[-0.78, damageFactor > 0.3 ? -damageFactor * 0.12 : 0, 0.25]}
+                  rotation={[0, 0, damageFactor > 0.3 ? -damageFactor * 0.25 : 0]}
+                >
+                  <mesh castShadow receiveShadow>
+                    <boxGeometry args={[0.08, 0.36, 1.35]} />
+                    <meshStandardMaterial 
+                      color="#252525" 
+                      metalness={0.95} 
+                      roughness={0.3} 
+                      emissive={damageFactor > 0.4 ? "#3d1100" : "#000000"}
+                    />
+                  </mesh>
+                </group>
+              )}
 
               {/* Right Side Armor plate sags & deforms as health drops */}
-              <group 
-                name="RightResponsiveArmor"
-                position={[0.78, damageFactor > 0.5 ? -damageFactor * 0.16 : 0, 0.25]}
-                rotation={[0, 0, damageFactor > 0.5 ? damageFactor * 0.32 : 0]}
-              >
-                <mesh castShadow receiveShadow>
-                  <boxGeometry args={[0.08, 0.36, 1.35]} />
-                  <meshStandardMaterial 
-                    color="#252525" 
-                    metalness={0.95} 
-                    roughness={0.3} 
-                    emissive={damageFactor > 0.6 ? "#3d1100" : "#000000"}
-                  />
-                </mesh>
-              </group>
+              {damageFactor <= 0.85 && (
+                <group 
+                  name="RightResponsiveArmor"
+                  position={[0.78, damageFactor > 0.5 ? -damageFactor * 0.16 : 0, 0.25]}
+                  rotation={[0, 0, damageFactor > 0.5 ? damageFactor * 0.32 : 0]}
+                >
+                  <mesh castShadow receiveShadow>
+                    <boxGeometry args={[0.08, 0.36, 1.35]} />
+                    <meshStandardMaterial 
+                      color="#252525" 
+                      metalness={0.95} 
+                      roughness={0.3} 
+                      emissive={damageFactor > 0.6 ? "#3d1100" : "#000000"}
+                    />
+                  </mesh>
+                </group>
+              )}
 
               {/* Rear Bumper protection sags and tilts */}
               <group 
@@ -1139,7 +1393,7 @@ const Bot = ({
           )}
           
           {/* Side armor panels (rendered only for non-drum bots, as drum has custom responsive side plates) */}
-          {actualWeaponType !== 'drum' && (
+          {actualWeaponType !== 'drum' && damageComponents?.rear?.visualState !== 'detached' && (
             <>
               <mesh castShadow receiveShadow position={[0.8, 0, 0]}>
                 <boxGeometry args={[0.15, 0.5, 2.1]} />
@@ -1153,7 +1407,7 @@ const Bot = ({
           )}
 
           {/* Engine block (rendered only for non-drum bots, as drum has custom frame pack) */}
-          {actualWeaponType !== 'drum' && (
+          {actualWeaponType !== 'drum' && damageComponents?.rear?.visualState !== 'detached' && (
             <mesh castShadow position={[0, 0.25, 0.8]}>
               <boxGeometry args={[0.8, 0.2, 0.4]} />
               <meshStandardMaterial color="#222" metalness={0.9} roughness={0.6} />
@@ -1161,7 +1415,7 @@ const Bot = ({
           )}
 
           {/* High-fidelity Weapon Systems */}
-          {actualWeaponType === 'flipper' && (
+          {actualWeaponType === 'flipper' && damageComponents?.front?.visualState !== 'detached' && (
             <>
               {/* Flipper base hinge pin */}
               <mesh castShadow position={[0, -0.1, -0.25]} rotation={[0, 0, Math.PI / 2]}>
@@ -1224,7 +1478,7 @@ const Bot = ({
             </>
           )}
 
-          {actualWeaponType === 'hammer' && (
+          {actualWeaponType === 'hammer' && damageComponents?.front?.visualState !== 'detached' && (
             <>
               {/* Heavy support A-frame towers */}
               <mesh castShadow position={[0.45, 0.0, 0.2]} rotation={[0, 0, 0.12]}>
@@ -1270,10 +1524,10 @@ const Bot = ({
             </>
           )}
 
-          {actualWeaponType === 'drum' && (
+          {actualWeaponType === 'drum' && damageComponents?.front?.visualState !== 'detached' && (
             <group name="DrumAssembly">
               {/* Chassis Frame Extensions / Mounts */}
-              <group position={[0, -0.1, -0.75]}>
+              <group position={[0, 0.15, -0.75]}>
                 {/* Axle connecting to weapon group */}
                 <mesh castShadow position={[0, -0.05, -0.3]} rotation={[0, 0, Math.PI / 2]}>
                   <cylinderGeometry args={[0.08, 0.08, 1.4, 16]} />
@@ -1282,50 +1536,57 @@ const Bot = ({
               </group>
 
               {/* The Spinning Drum Weapon Assembly */}
-              <group ref={weaponRef} position={[0, -0.15, -1.05]}>
-                {/* Core Drum */}
+              <group ref={weaponRef} position={[0, 0.1, -1.05]}>
+                {/* Core Drum Barrel */}
                 <mesh name="DrumCore" castShadow rotation={[0, 0, Math.PI / 2]}>
                   <cylinderGeometry args={[0.3, 0.3, 1.12, 32]} />
                   <meshStandardMaterial color="#2a2a2a" metalness={0.9} roughness={0.2} emissive="#ff0000" emissiveIntensity={0} />
                 </mesh>
                 
                 {/* Rotation Cues: Grooves and Bands */}
-                <mesh castShadow rotation={[0, 0, Math.PI / 2]} position={[0.3, 0, 0]}>
+                <mesh castShadow rotation={[0, 0, Math.PI / 2]} position={[0.4, 0, 0]}>
                    <cylinderGeometry args={[0.31, 0.31, 0.1, 32]} />
                    <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.1} />
                 </mesh>
-                <mesh castShadow rotation={[0, 0, Math.PI / 2]} position={[-0.3, 0, 0]}>
+                <mesh castShadow rotation={[0, 0, Math.PI / 2]} position={[-0.4, 0, 0]}>
                    <cylinderGeometry args={[0.31, 0.31, 0.1, 32]} />
                    <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.1} />
                 </mesh>
 
-                {/* Impact Teeth Assembly (Opposed 180 degrees) */}
-                <group>
-                  {/* Top Tooth */}
-                  <mesh name="DrumTooth" castShadow position={[0, 0.32, 0]} rotation={[0, 0, 0]}>
-                    <boxGeometry args={[0.8, 0.15, 0.15]} />
-                    <meshStandardMaterial color="#FF3300" metalness={0.8} roughness={0.2} emissive="#551100" emissiveIntensity={0.1} />
-                  </mesh>
-                  {/* Bottom Tooth */}
-                  <mesh name="DrumTooth" castShadow position={[0, -0.32, 0]} rotation={[0, 0, 0]}>
-                    <boxGeometry args={[0.8, 0.15, 0.15]} />
-                    <meshStandardMaterial color="#FF3300" metalness={0.8} roughness={0.2} emissive="#551100" emissiveIntensity={0.1} />
-                  </mesh>
-                  {/* Side Fins for extra rotation readability */}
-                  <mesh castShadow position={[0, 0, 0.31]}>
-                    <boxGeometry args={[1.0, 0.05, 0.1]} />
-                    <meshStandardMaterial color="#777" metalness={0.9} roughness={0.3} />
-                  </mesh>
-                  <mesh castShadow position={[0, 0, -0.31]}>
-                    <boxGeometry args={[1.0, 0.05, 0.1]} />
-                    <meshStandardMaterial color="#777" metalness={0.9} roughness={0.3} />
-                  </mesh>
-                </group>
+                {/* 8 Menacing Staggered Horizontal Steel Spikes */}
+                {[
+                  { angle: 0, x: -0.4 },
+                  { angle: Math.PI / 4, x: -0.2 },
+                  { angle: Math.PI / 2, x: 0 },
+                  { angle: (3 * Math.PI) / 4, x: 0.2 },
+                  { angle: Math.PI, x: 0.4 },
+                  { angle: (5 * Math.PI) / 4, x: -0.3 },
+                  { angle: (3 * Math.PI) / 2, x: -0.1 },
+                  { angle: (7 * Math.PI) / 4, x: 0.3 },
+                ].map((spike, idx) => {
+                  const radius = 0.3;
+                  const sy = Math.sin(spike.angle) * radius;
+                  const sz = Math.cos(spike.angle) * radius;
+                  return (
+                    <group key={idx} position={[spike.x, sy, sz]} rotation={[spike.angle, 0, 0]}>
+                      {/* Heavy spike base */}
+                      <mesh castShadow>
+                        <boxGeometry args={[0.15, 0.12, 0.15]} />
+                        <meshStandardMaterial color="#444" metalness={0.9} roughness={0.2} />
+                      </mesh>
+                      {/* Sharp steel ripping tooth/spike pointing radially outward */}
+                      <mesh name="DrumTooth" castShadow position={[0, 0.14, 0]} rotation={[0, 0, 0]}>
+                        <coneGeometry args={[0.07, 0.24, 4]} />
+                        <meshStandardMaterial color="#ff3300" metalness={0.9} roughness={0.1} emissive="#ff3300" emissiveIntensity={0.2} />
+                      </mesh>
+                    </group>
+                  );
+                })}
               </group>
 
               {/* Elite Upgrade 2: Dynamic Laser Target Finder & Weapon Status HUD Overlay */}
               {isPlayer && isSpinning && (
-                <group position={[0, -0.15, -1.1]}>
+                <group position={[0, 0.1, -1.1]}>
                   {/* Aiming guide laser line */}
                   <mesh position={[0, 0, -3.5]} rotation={[Math.PI / 2, 0, 0]}>
                     <cylinderGeometry args={[0.012, 0.012, 7, 8]} />
@@ -1351,7 +1612,7 @@ const Bot = ({
             </group>
           )}
 
-          {actualWeaponType === 'crusher' && (
+          {actualWeaponType === 'crusher' && damageComponents?.front?.visualState !== 'detached' && (
             <>
               {/* Lower Jaw (fixed to bottom-front of chassis) */}
               <mesh castShadow position={[0, -0.22, -0.95]}>
@@ -1423,7 +1684,7 @@ const Bot = ({
               {/* Extremely thin razor sharp circular saw blade */}
               <mesh castShadow position={[0, 0, 0]}>
                 <cylinderGeometry args={[0.85, 0.85, 0.02, 32]} />
-                <meshStandardMaterial color="#silver" metalness={0.95} roughness={0.05} />
+                <meshStandardMaterial color="silver" metalness={0.95} roughness={0.05} />
               </mesh>
               {/* 8 sharp saw teeth around the edge! */}
               {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => {
@@ -1451,7 +1712,7 @@ const Bot = ({
         )}
         
         <group position={[0, 0.3, -1.1]}>
-          {(actualWeaponType === 'spinner' || actualWeaponType === 'saw') && (
+          {(actualWeaponType === 'spinner' || actualWeaponType === 'saw') && damageComponents?.front?.visualState !== 'detached' && (
             <CylinderCollider 
               args={[0.1, 0.8]}
               onCollisionEnter={({ other }) => {
@@ -1459,14 +1720,19 @@ const Bot = ({
                 const now = Date.now();
                 if (now - lastHitTime.current < 250) return;
                 
-                if (isSpinning && Math.abs(currentRPM.current) > 10) {
-                  lastHitTime.current = now;
-                  const target = isPlayer ? 'opponent' : 'player';
-                  const damageBase = currentBotConfig.weapon.damage;
-                  const damageMult = Math.abs(currentRPM.current) / (currentBotConfig.weapon.rpm / 100);
-                  let finalDamage = damageBase * 0.1 * damageMult;
-                  
-                  damageBot(target, finalDamage);
+                const targetObj = other.rigidBodyObject;
+                if (targetObj?.userData?.id === (isPlayer ? 'opponent' : 'player')) {
+                  if (isSpinning && Math.abs(currentRPM.current) > 10) {
+                    lastHitTime.current = now;
+                    const target = isPlayer ? 'opponent' : 'player';
+                    const damageBase = currentBotConfig.weapon.damage;
+                    const damageMult = Math.abs(currentRPM.current * 100) / currentBotConfig.weapon.rpm;
+                    let finalDamage = damageBase * 0.15 * Math.min(1.0, damageMult);
+                    
+                    damageBot(target, finalDamage);
+                  if (finalDamage > 2.0) {
+                    useGameStore.getState().addLog(`⚙️ SHREDDED! ${actualWeaponType.toUpperCase()} tore into ${target} for massive damage!`, 'combat');
+                  }
                   
                   if (targetRef?.current && bodyRef.current) {
                     const targetPos = targetRef.current.translation();
@@ -1477,18 +1743,19 @@ const Bot = ({
                     const dnz = dz / dDist;
                     
                     const targetWeightMult = (isPlayer ? opponentConfig.armor.weight : config.armor.weight) / 100;
-                    const pushForce = 35 * Math.abs(currentRPM.current) * settings.impactImpulseScale / targetWeightMult;
+                    const pushForce = 0.5 * Math.abs(currentRPM.current) * settings.impactImpulseScale / targetWeightMult;
                     
-                    targetRef.current.applyImpulse({ x: dnx * pushForce, y: 40 * settings.impactImpulseScale / targetWeightMult, z: dnz * pushForce }, true);
+                    targetRef.current.applyImpulse({ x: dnx * pushForce, y: 8 * settings.impactImpulseScale / targetWeightMult, z: dnz * pushForce }, true);
                     bodyRef.current.applyImpulse({ x: -dnx * pushForce * 0.4, y: 0, z: -dnz * pushForce * 0.4 }, true);
                     
                     const pos = bodyRef.current.translation();
                     const impactVector = [dnx * pushForce * 0.5, 5, dnz * pushForce * 0.5] as [number, number, number];
-                    useGameStore.getState().spawnDebris([pos.x, pos.y, pos.z], finalDamage * 2, impactVector);
-                    useGameStore.getState().spawnSparks([pos.x, pos.y, pos.z], Math.floor(finalDamage), '#FFAA00');
+                    useGameStore.getState().spawnDebris([pos.x, pos.y, pos.z], finalDamage * 10, impactVector);
+                    useGameStore.getState().spawnSparks([pos.x, pos.y, pos.z], Math.floor(finalDamage * 5), '#FFAA00');
                   }
                   currentRPM.current *= 0.5;
                 }
+                } // Close targetObj id check
               }}
             />
           )}
@@ -1496,9 +1763,10 @@ const Bot = ({
         
         {/* DRUM WEAPON COLLIDER */}
         {actualWeaponType === 'drum' && (
-          <group position={[0, -0.15, -1.05]} rotation={[0, 0, Math.PI / 2]}>
+          <group position={[0, 0.1, -1.05]} rotation={[0, 0, Math.PI / 2]}>
             <CylinderCollider 
               args={[1.12 / 2, 0.35]}
+              friction={0.05}
               
               onCollisionEnter={(event) => {
                 if (battleStatus !== 'battle') return;
@@ -1552,23 +1820,26 @@ const Bot = ({
                       isDirect = true;
                     }
                     
-                    const rpmRatio = Math.abs(currentRPM.current) / (currentBotConfig.weapon.rpm / 100);
+                    const rpmRatio = Math.abs(currentRPM.current * 100) / currentBotConfig.weapon.rpm;
                     
                     // Base damage for drum
                     const damageBase = currentBotConfig.weapon.damage * 1.5;
-                    let finalDamage = damageBase * 0.15 * rpmRatio * glanceRatio;
+                    let finalDamage = damageBase * 0.15 * Math.min(1.0, rpmRatio) * glanceRatio;
                     
                     damageBot(targetId, finalDamage);
+                    if (finalDamage > 2.0) {
+                      useGameStore.getState().addLog(`🔥 BRUTAL HIT! Drum spinner launched ${targetId} into the air!`, 'combat');
+                    }
                     
                     // Impulses
                     const targetWeightMult = (isPlayer ? opponentConfig.armor.weight : config.armor.weight) / 100;
                     
                     // Direct hit applies massive vertical lift and horizontal push
                     // Glancing hit applies less lift, more deflection
-                    const maxLift = 400 * settings.impactImpulseScale;
-                    const maxPush = 200 * settings.impactImpulseScale;
-                    const liftForce = Math.min((isDirect ? 170 : 85) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxLift);
-                    const pushForce = Math.min((isDirect ? 65 : 25) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxPush);
+                    const maxLift = 60 * settings.impactImpulseScale;
+                    const maxPush = 40 * settings.impactImpulseScale;
+                    const liftForce = Math.min((isDirect ? 40 : 20) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxLift);
+                    const pushForce = Math.min((isDirect ? 25 : 10) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxPush);
                     
                     targetBody.applyImpulse({ x: collisionNormal.x * pushForce, y: liftForce, z: collisionNormal.z * pushForce }, true);
                     
@@ -1582,10 +1853,10 @@ const Bot = ({
                     
                     // Effects
                     const impactY = (tPos.y + sPos.y) * 0.5;
-                    useGameStore.getState().spawnSparks([sPos.x + collisionNormal.x * 1.0, impactY, sPos.z + collisionNormal.z * 1.0], Math.floor(finalDamage * 1.5), '#FF4400');
+                    useGameStore.getState().spawnSparks([sPos.x + collisionNormal.x * 1.0, impactY, sPos.z + collisionNormal.z * 1.0], Math.floor(finalDamage * 8), '#FF4400');
                     
                     if (isDirect) {
-                      useGameStore.getState().spawnDebris([sPos.x + collisionNormal.x * 1.0, impactY, sPos.z + collisionNormal.z * 1.0], finalDamage * 2, [collisionNormal.x * pushForce * 0.1, liftForce * 0.1, collisionNormal.z * pushForce * 0.1]);
+                      useGameStore.getState().spawnDebris([sPos.x + collisionNormal.x * 1.0, impactY, sPos.z + collisionNormal.z * 1.0], finalDamage * 10, [collisionNormal.x * pushForce * 0.1, liftForce * 0.1, collisionNormal.z * pushForce * 0.1]);
                       
                       // Elite Upgrade 4: Shockwave System Event Trigger on direct weapon contact
                       window.dispatchEvent(new CustomEvent('spawn-shockwave', { 
@@ -1602,10 +1873,11 @@ const Bot = ({
           </group>
         )}
 
-        {/* Wheels and Motors with Skid Steer rotation refs and outer radial bolts to display coin-like rolling motion clearly */}
+                {/* Wheels and Motors with Skid Steer rotation refs and outer radial bolts to display coin-like rolling motion clearly */}
         {!isCustom && (
         <group>
           {/* Front Right */}
+          {damageComponents?.right?.visualState !== 'detached' && (
           <group ref={frontRightWheelRef} position={[0.9, 0.4, -0.6]}>
             <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.42, 0.42, 0.3, 16]} />
@@ -1630,8 +1902,10 @@ const Bot = ({
               );
             })}
           </group>
+          )}
           
           {/* Front Left */}
+          {damageComponents?.left?.visualState !== 'detached' && (
           <group ref={frontLeftWheelRef} position={[-0.9, 0.4, -0.6]}>
             <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.42, 0.42, 0.3, 16]} />
@@ -1655,8 +1929,10 @@ const Bot = ({
               );
             })}
           </group>
+          )}
 
           {/* Back Right */}
+          {damageComponents?.right?.visualState !== 'detached' && (
           <group ref={backRightWheelRef} position={[0.9, 0.4, 0.6]}>
             <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.42, 0.42, 0.3, 16]} />
@@ -1680,8 +1956,10 @@ const Bot = ({
               );
             })}
           </group>
+          )}
 
           {/* Back Left */}
+          {damageComponents?.left?.visualState !== 'detached' && (
           <group ref={backLeftWheelRef} position={[-0.9, 0.4, 0.6]}>
             <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.42, 0.42, 0.3, 16]} />
@@ -1705,8 +1983,10 @@ const Bot = ({
               );
             })}
           </group>
+          )}
         </group>
         )}
+        
                 </group>
       </RigidBody>
     </>
@@ -1739,6 +2019,8 @@ const HazardSaw = ({ position }: { position: [number, number, number] }) => {
   const meshRef = useRef<THREE.Mesh>(null);
   const damageBot = useGameStore(s => s.damageBot);
   const battleStatus = useGameStore(s => s.battleStatus);
+  const lastHitPlayer = useRef(0);
+  const lastHitOpponent = useRef(0);
 
   useFrame((state, delta) => {
     if (meshRef.current) {
@@ -1747,14 +2029,21 @@ const HazardSaw = ({ position }: { position: [number, number, number] }) => {
   });
 
   return (
-    <RigidBody 
+    <RigidBody ccd={true} 
       type="fixed" 
       position={position}
       colliders="cuboid"
-      onCollisionEnter={() => {
+      onCollisionEnter={({ other }) => {
         if (battleStatus === 'battle') {
-          damageBot('player', 1.5 + Math.random() * 2);
-          damageBot('opponent', 1.5 + Math.random() * 2);
+          const id = other.rigidBodyObject?.userData?.id;
+          const now = Date.now();
+          if (id === 'player' && now - lastHitPlayer.current > 500) {
+            lastHitPlayer.current = now;
+            damageBot('player', 1.5 + Math.random() * 2);
+          } else if (id === 'opponent' && now - lastHitOpponent.current > 500) {
+            lastHitOpponent.current = now;
+            damageBot('opponent', 1.5 + Math.random() * 2);
+          }
         }
       }}
     >
@@ -1776,42 +2065,373 @@ const HazardSaw = ({ position }: { position: [number, number, number] }) => {
 
 const IndustrialPillar = ({ position }: { position: [number, number, number] }) => {
   return (
-    <RigidBody type="fixed" position={position}>
-      {/* Pillar Column */}
-      <mesh castShadow receiveShadow position={[0, 2, 0]}>
-        <boxGeometry args={[1.5, 4, 1.5]} />
-        <meshStandardMaterial color="#333" roughness={0.9} />
+    <RigidBody ccd={true} type="fixed" position={position}>
+      {/* Heavy base */}
+      <mesh castShadow position={[0, 0.3, 0]}>
+        <cylinderGeometry args={[1.1, 1.3, 0.6, 8]} />
+        <meshStandardMaterial color="#111" metalness={0.9} roughness={0.2} />
       </mesh>
-      <mesh position={[0, 4.1, 0]}>
-        <boxGeometry args={[1.6, 0.2, 1.6]} />
-        <meshStandardMaterial color="#FFC107" roughness={0.5} />
+      
+      {/* Cyber Pylon Sections */}
+      <mesh castShadow position={[0, 1.3, 0]}>
+        <cylinderGeometry args={[0.7, 0.8, 1.4, 8]} />
+        <meshStandardMaterial color="#222" metalness={0.8} roughness={0.3} />
+      </mesh>
+      
+      {/* Glowing horizontal energy ring */}
+      <mesh position={[0, 2.1, 0]}>
+        <cylinderGeometry args={[0.72, 0.72, 0.2, 8]} />
+        <meshBasicMaterial color="#00E5FF" toneMapped={false} />
+      </mesh>
+      
+      <mesh castShadow position={[0, 2.9, 0]}>
+        <cylinderGeometry args={[0.6, 0.7, 1.4, 8]} />
+        <meshStandardMaterial color="#222" metalness={0.8} roughness={0.3} />
+      </mesh>
+      
+      {/* Top Cap with glowing red status light */}
+      <mesh position={[0, 3.65, 0]}>
+        <cylinderGeometry args={[0.5, 0.6, 0.1, 8]} />
+        <meshStandardMaterial color="#FF3300" emissive="#FF3300" emissiveIntensity={2} toneMapped={false} />
       </mesh>
     </RigidBody>
   );
 };
 
-const SparkSystem = () => {
+const UnifiedVisualEffectsManager = () => {
   const sparksList = useGameStore(s => s.sparks);
-  const settings = useGameStore(s => s.settings);
+  const sparksMeshRef = useRef<THREE.InstancedMesh>(null);
+  const smokeMeshRef = useRef<THREE.InstancedMesh>(null);
+  const dummyObj = useMemo(() => new THREE.Object3D(), []);
+
+  const lightRefs = useRef<(THREE.PointLight | null)[]>([]);
+  const lightActiveIndex = useRef(0);
+  const lightData = useRef<{ pos: THREE.Vector3; intensity: number }[]>([
+    { pos: new THREE.Vector3(), intensity: 0 },
+    { pos: new THREE.Vector3(), intensity: 0 },
+    { pos: new THREE.Vector3(), intensity: 0 },
+    { pos: new THREE.Vector3(), intensity: 0 },
+  ]);
+
+  const sparkParticles = useRef<{ pos: THREE.Vector3; vel: THREE.Vector3; color: THREE.Color; age: number; maxAge: number; size: number }[]>([]);
+  const smokeParticles = useRef<{ pos: THREE.Vector3; vel: THREE.Vector3; age: number; maxAge: number; rot: number; rotSpeed: number; startSize: number; targetSize: number; isFire: boolean }[]>([]);
+
+  const lastProcessedId = useRef<string>('');
+  
+  useEffect(() => {
+    if (sparksList.length === 0) return;
+    const latest = sparksList[sparksList.length - 1];
+    if (latest.id === lastProcessedId.current) return;
+    lastProcessedId.current = latest.id;
+
+    const pos = new THREE.Vector3(latest.position[0], latest.position[1], latest.position[2]);
+    const col = new THREE.Color(latest.color);
+
+    // 1. Trigger Flash Light in Pool
+    const idx = lightActiveIndex.current;
+    lightData.current[idx].pos.copy(pos);
+    lightData.current[idx].pos.y += 0.2; // raise slightly
+    lightData.current[idx].intensity = 6.0; // intense burst
+    lightActiveIndex.current = (idx + 1) % 4;
+
+    // 2. Spawn metal sparks
+    const numSparks = 18;
+    for (let i = 0; i < numSparks; i++) {
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos((Math.random() * 0.8) - 0.2); // upward spray
+      const speed = Math.random() * 16 + 6;
+      
+      const vel = new THREE.Vector3(
+        Math.sin(phi) * Math.cos(theta) * speed,
+        Math.cos(phi) * speed + 2.5,
+        Math.sin(phi) * Math.sin(theta) * speed
+      );
+
+      sparkParticles.current.push({
+        pos: pos.clone(),
+        vel,
+        color: col.clone(),
+        age: 0,
+        maxAge: Math.random() * 0.7 + 0.35,
+        size: Math.random() * 0.045 + 0.015
+      });
+    }
+
+    // 3. Spawn expanding smoke/fire puffs
+    const numSmoke = 8;
+    for (let i = 0; i < numSmoke; i++) {
+      const vel = new THREE.Vector3(
+        (Math.random() - 0.5) * 2.5,
+        Math.random() * 3.0 + 1.2,
+        (Math.random() - 0.5) * 2.5
+      );
+      
+      const isFire = Math.random() < 0.45;
+      
+      smokeParticles.current.push({
+        pos: pos.clone().add(new THREE.Vector3(
+          (Math.random() - 0.5) * 0.2,
+          (Math.random() - 0.5) * 0.2,
+          (Math.random() - 0.5) * 0.2
+        )),
+        vel,
+        age: 0,
+        maxAge: Math.random() * 1.0 + 0.5,
+        rot: Math.random() * Math.PI * 2,
+        rotSpeed: (Math.random() - 0.5) * 1.5,
+        startSize: Math.random() * 0.08 + 0.04,
+        targetSize: Math.random() * 0.55 + 0.35,
+        isFire
+      });
+    }
+  }, [sparksList]);
+
+  useFrame((state, delta) => {
+    const finalDelta = Math.min(delta, 0.1);
+
+    // --- DECAY LIGHTS ---
+    for (let i = 0; i < 4; i++) {
+      const data = lightData.current[i];
+      const light = lightRefs.current[i];
+      if (light && data.intensity > 0) {
+        data.intensity -= finalDelta * 16.0;
+        if (data.intensity < 0) data.intensity = 0;
+        light.intensity = data.intensity;
+        light.position.copy(data.pos);
+      }
+    }
+
+    // --- UPDATE SPARKS ---
+    const activeSparks = [];
+    const numSparks = sparkParticles.current.length;
+    for (let i = 0; i < numSparks; i++) {
+      const p = sparkParticles.current[i];
+      p.age += finalDelta;
+      if (p.age < p.maxAge) {
+        p.vel.y -= 24.0 * finalDelta;
+        p.vel.multiplyScalar(1.0 - 0.9 * finalDelta);
+        p.pos.addScaledVector(p.vel, finalDelta);
+
+        // bounce on floor
+        if (p.pos.y < 0.05) {
+          p.pos.y = 0.05;
+          p.vel.y *= -0.5;
+          p.vel.x *= 0.65;
+          p.vel.z *= 0.65;
+        }
+        activeSparks.push(p);
+      }
+    }
+    sparkParticles.current = activeSparks;
+
+    if (sparksMeshRef.current) {
+      const count = sparkParticles.current.length;
+      sparksMeshRef.current.count = count;
+      for (let i = 0; i < count; i++) {
+        const p = sparkParticles.current[i];
+        dummyObj.position.copy(p.pos);
+        const speedSq = p.vel.lengthSq();
+        const stretch = Math.max(1.0, speedSq * 0.015);
+        dummyObj.scale.set(p.size, p.size, p.size * stretch);
+        
+        if (speedSq > 0.1) {
+          dummyObj.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), p.vel.clone().normalize());
+        } else {
+          dummyObj.quaternion.set(0, 0, 0, 1);
+        }
+        
+        dummyObj.updateMatrix();
+        sparksMeshRef.current.setMatrixAt(i, dummyObj.matrix);
+
+        const fade = Math.max(0, 1 - (p.age / p.maxAge));
+        const col = p.color.clone().multiplyScalar(fade * 3.5);
+        sparksMeshRef.current.setColorAt(i, col);
+      }
+      if (count > 0) {
+        sparksMeshRef.current.instanceMatrix.needsUpdate = true;
+        if (sparksMeshRef.current.instanceColor) sparksMeshRef.current.instanceColor.needsUpdate = true;
+      }
+    }
+
+    // --- UPDATE SMOKE & FIRE ---
+    const activeSmoke = [];
+    const numSmoke = smokeParticles.current.length;
+    for (let i = 0; i < numSmoke; i++) {
+      const p = smokeParticles.current[i];
+      p.age += finalDelta;
+      if (p.age < p.maxAge) {
+        p.vel.y += 1.4 * finalDelta;
+        p.vel.multiplyScalar(1.0 - 1.3 * finalDelta);
+        p.pos.addScaledVector(p.vel, finalDelta);
+        p.rot += p.rotSpeed * finalDelta;
+        activeSmoke.push(p);
+      }
+    }
+    smokeParticles.current = activeSmoke;
+
+    if (smokeMeshRef.current) {
+      const count = smokeParticles.current.length;
+      smokeMeshRef.current.count = count;
+      for (let i = 0; i < count; i++) {
+        const p = smokeParticles.current[i];
+        dummyObj.position.copy(p.pos);
+        const pct = p.age / p.maxAge;
+        const size = p.startSize + (p.targetSize - p.startSize) * pct;
+        dummyObj.scale.set(size, size, size);
+        dummyObj.rotation.set(p.rot * 0.25, p.rot, p.rot * 0.45);
+        dummyObj.updateMatrix();
+        smokeMeshRef.current.setMatrixAt(i, dummyObj.matrix);
+
+        // color shifting
+        let r = 0.25, g = 0.25, b = 0.25;
+        let intensity = 1.0;
+        if (p.isFire) {
+          if (pct < 0.25) {
+            r = 1.0; g = 0.95; b = 0.6; intensity = 3.2;
+          } else if (pct < 0.55) {
+            r = 1.0; g = 0.38; b = 0.02; intensity = 2.0;
+          } else {
+            r = 0.15; g = 0.15; b = 0.15; intensity = 0.55;
+          }
+        } else {
+          const shade = 0.15 + 0.15 * (1.0 - pct);
+          r = shade; g = shade; b = shade; intensity = 0.75;
+        }
+
+        const fade = Math.max(0, 1 - pct);
+        const col = new THREE.Color(r, g, b).multiplyScalar(intensity * fade);
+        smokeMeshRef.current.setColorAt(i, col);
+      }
+      if (count > 0) {
+        smokeMeshRef.current.instanceMatrix.needsUpdate = true;
+        if (smokeMeshRef.current.instanceColor) smokeMeshRef.current.instanceColor.needsUpdate = true;
+      }
+    }
+  });
 
   return (
-    <group>
-      {sparksList.map((s) => (
-        <RigidBody
-          key={s.id}
-          position={s.position}
-          linearVelocity={s.velocity}
-          colliders="ball"
-          mass={0.01}
-          type="dynamic"
-        >
-          <mesh>
-             {settings.fragmentQuality === 'high' ? <sphereGeometry args={[0.08, 8, 8]} /> : settings.fragmentQuality === 'medium' ? <sphereGeometry args={[0.08, 4, 4]} /> : <boxGeometry args={[0.1, 0.1, 0.1]} />}
-             <meshBasicMaterial color={s.color} />
-          </mesh>
-        </RigidBody>
+    <>
+      {Array.from({ length: 4 }).map((_, i) => (
+        <pointLight
+          key={i}
+          ref={(el) => { lightRefs.current[i] = el; }}
+          distance={10}
+          intensity={0}
+          color="#FF6A00"
+        />
       ))}
-    </group>
+
+      <instancedMesh ref={sparksMeshRef} args={[undefined, undefined, 400]}>
+        <boxGeometry args={[1, 1, 1]} />
+        <meshBasicMaterial toneMapped={false} blending={THREE.AdditiveBlending} transparent opacity={0.9} />
+      </instancedMesh>
+
+      <instancedMesh ref={smokeMeshRef} args={[undefined, undefined, 200]}>
+        <dodecahedronGeometry args={[1, 0]} />
+        <meshStandardMaterial 
+          toneMapped={false} 
+          roughness={0.95} 
+          metalness={0.02} 
+          transparent 
+          opacity={0.35} 
+          blending={THREE.NormalBlending}
+        />
+      </instancedMesh>
+    </>
+  );
+};
+
+const MovingSpotlights = () => {
+  const lightRefs = useRef<(THREE.SpotLight | null)[]>([]);
+  const beamRefs = useRef<(THREE.Mesh | null)[]>([]);
+  const targetPos = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
+
+  useFrame((state) => {
+    const elapsed = state.clock.getElapsedTime();
+    
+    // Follow the midpoint between Player and Opponent
+    const pPos = globalPhysicsState.player.pos;
+    const oPos = globalPhysicsState.opponent.pos;
+    const mid = new THREE.Vector3().addVectors(pPos, oPos).multiplyScalar(0.5);
+    
+    // Slight stylistic manual wander
+    mid.x += Math.sin(elapsed * 1.4) * 1.0;
+    mid.z += Math.cos(elapsed * 1.1) * 1.0;
+    
+    targetPos.current.lerp(mid, 0.08);
+
+    const positions: [number, number, number][] = [
+      [14.5, 9.0, 14.5],
+      [-14.5, 9.0, -14.5],
+      [14.5, 9.0, -14.5],
+      [-14.5, 9.0, 14.5]
+    ];
+
+    for (let i = 0; i < 4; i++) {
+      const spot = lightRefs.current[i];
+      const beam = beamRefs.current[i];
+      if (spot) {
+        spot.target.position.copy(targetPos.current);
+        spot.target.updateMatrixWorld();
+      }
+      
+      if (beam) {
+        const start = new THREE.Vector3(...positions[i]);
+        const end = targetPos.current.clone();
+        const beamMid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+        beam.position.copy(beamMid);
+        
+        const dist = start.distanceTo(end);
+        beam.scale.set(0.6, dist, 0.6);
+        
+        const direction = new THREE.Vector3().subVectors(end, start).normalize();
+        const up = new THREE.Vector3(0, 1, 0);
+        beam.quaternion.setFromUnitVectors(up, direction);
+      }
+    }
+  });
+
+  const positions: [number, number, number][] = [
+    [14.5, 9.0, 14.5],
+    [-14.5, 9.0, -14.5],
+    [14.5, 9.0, -14.5],
+    [-14.5, 9.0, 14.5]
+  ];
+  const colors = ["#00E5FF", "#FF1744", "#D500F9", "#00E676"];
+
+  return (
+    <>
+      {positions.map((pos, i) => (
+        <group key={i}>
+          <mesh position={pos}>
+            <sphereGeometry args={[0.3, 16, 16]} />
+            <meshStandardMaterial color="#222" metalness={0.9} roughness={0.1} />
+          </mesh>
+          <spotLight
+            ref={(el) => { lightRefs.current[i] = el; }}
+            position={pos}
+            angle={0.24}
+            penumbra={0.8}
+            intensity={4.0}
+            distance={30}
+            color={colors[i]}
+            castShadow
+            shadow-mapSize={[512, 512]}
+          />
+          <mesh ref={(el) => { beamRefs.current[i] = el; }}>
+            <cylinderGeometry args={[0.02, 0.45, 1, 16, 1, true]} />
+            <meshBasicMaterial 
+              color={colors[i]} 
+              transparent 
+              opacity={0.06} 
+              blending={THREE.AdditiveBlending} 
+              depthWrite={false}
+              side={THREE.DoubleSide}
+            />
+          </mesh>
+        </group>
+      ))}
+    </>
   );
 };
 
@@ -1822,7 +2442,7 @@ const DebrisSystem = () => {
   return (
     <group>
       {debrisList.map((d) => (
-        <RigidBody 
+        <RigidBody ccd={true} 
           key={d.id} 
           position={d.position} 
           linearVelocity={d.velocity} 
@@ -1923,27 +2543,43 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
   const opponentRef = useRef<any>(null);
   const targetObjRef = useRef<THREE.Object3D>(new THREE.Object3D());
   const battleStatus = useGameStore(s => s.battleStatus);
+  const matchCount = useGameStore(s => s.matchCount);
   const settings = useGameStore(s => s.settings);
+  const [debugPhysics, setDebugPhysics] = useState(false);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 'p') {
+        setDebugPhysics(v => !v);
+        useGameStore.getState().addLog(`Physics Debug: ${!debugPhysics ? 'ON' : 'OFF'}`, 'info');
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [debugPhysics]);
 
   return (
     <div className="absolute inset-0 z-0 bg-[#121212]">
       <Canvas shadows camera={{ position: [0, 12, 16], fov: 40 }}>
-        <color attach="background" args={['#1c1d1e']} />
+        <color attach="background" args={['#101112']} />
         
         {/* Dynamic lighting based on Performance Mode settings */}
-        <ambientLight intensity={settings.performanceMode ? 0.7 : 0.5} />
+        <ambientLight intensity={settings.performanceMode ? 0.6 : 0.4} />
         <directionalLight 
           position={[10, 25, 10]} 
-          intensity={1.2} 
+          intensity={1.0} 
           castShadow={!settings.performanceMode} 
-          shadow-mapSize={settings.performanceMode ? [256, 256] : [2048, 2048]} 
-          color="#f4f4f4"
+          shadow-mapSize={settings.performanceMode ? [256, 256] : [1024, 1024]} 
+          color="#e8f4fc"
         />
-        <pointLight position={[-15, 10, -15]} intensity={1.5} color="#e0e0e0" distance={40} />
-        <pointLight position={[15, 10, 15]} intensity={1} color="#c0c0c0" distance={40} />
+        <pointLight position={[-15, 10, -15]} intensity={1.0} color="#00E5FF" distance={40} />
+        <pointLight position={[15, 10, 15]} intensity={1.0} color="#FF1744" distance={40} />
 
         <PlayerTracker playerRef={playerRef} targetObjRef={targetObjRef} />
         <CameraManager targetRef={targetObjRef} playerBodyRef={playerRef} opponentBodyRef={opponentRef} />
+        
+        {/* Moving Spotlights Tracking the Battlebots */}
+        <MovingSpotlights />
 
         {/* Environment details reduced under Performance Mode */}
         <Grid 
@@ -1954,50 +2590,100 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
           cellThickness={0.8} 
           sectionSize={5} 
           sectionThickness={1.5} 
-          cellColor="#2a2a2a" 
-          sectionColor="#333333" 
+          cellColor="#1b1c1e" 
+          sectionColor="#2d3035" 
           fadeDistance={60} 
         />
         
+        {/* Dark Metallic Industrial Floor Base */}
         <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow position={[0, 0, 0]}>
           <planeGeometry args={[100, 100]} />
-          <meshStandardMaterial color="#1f2122" roughness={0.85} metalness={0.1} />
+          <meshStandardMaterial color="#141517" roughness={0.75} metalness={0.7} />
         </mesh>
+
+        {/* Cyber Tactical Glow Overlays (Floor Graphics) */}
+        {!settings.performanceMode && (
+          <group position={[0, 0.02, 0]}>
+            {/* Center Battle ring - Hot Orange */}
+            <mesh rotation={[-Math.PI / 2, 0, 0]}>
+              <ringGeometry args={[2.92, 3.08, 32]} />
+              <meshBasicMaterial color="#FF5500" toneMapped={false} transparent opacity={0.85} />
+            </mesh>
+            {/* Outer warning ring - Neon Cyan */}
+            <mesh rotation={[-Math.PI / 2, 0, 0]}>
+              <ringGeometry args={[12.8, 13.0, 64]} />
+              <meshBasicMaterial color="#00E5FF" toneMapped={false} transparent opacity={0.65} />
+            </mesh>
+            {/* Center crosshair hash marks */}
+            <mesh position={[0, 0, 0]}>
+              <boxGeometry args={[1.5, 0.005, 0.06]} />
+              <meshBasicMaterial color="#FF5500" toneMapped={false} transparent opacity={0.5} />
+            </mesh>
+            <mesh position={[0, 0, 0]}>
+              <boxGeometry args={[0.06, 0.005, 1.5]} />
+              <meshBasicMaterial color="#FF5500" toneMapped={false} transparent opacity={0.5} />
+            </mesh>
+          </group>
+        )}
+
+        {/* Futuristic Glowing Neon Perimeter Wall Tubes */}
+        <group position={[0, 2.4, 0]}>
+          {/* Cyan/Blue back light tube */}
+          <mesh position={[0, 0, -15.02]}>
+            <boxGeometry args={[30.1, 0.08, 0.08]} />
+            <meshBasicMaterial color="#00E5FF" toneMapped={false} />
+          </mesh>
+          {/* Orange front light tube */}
+          <mesh position={[0, 0, 15.02]}>
+            <boxGeometry args={[30.1, 0.08, 0.08]} />
+            <meshBasicMaterial color="#FF5500" toneMapped={false} />
+          </mesh>
+          {/* Cyan/Blue left light tube */}
+          <mesh position={[-15.02, 0, 0]}>
+            <boxGeometry args={[0.08, 0.08, 30.1]} />
+            <meshBasicMaterial color="#00E5FF" toneMapped={false} />
+          </mesh>
+          {/* Orange right light tube */}
+          <mesh position={[15.02, 0, 0]}>
+            <boxGeometry args={[0.08, 0.08, 30.1]} />
+            <meshBasicMaterial color="#FF5500" toneMapped={false} />
+          </mesh>
+        </group>
         
         <ContactShadows position={[0, 0.02, 0]} opacity={0.6} scale={50} blur={2.5} far={5} />
 
-        <Physics>
+        <Physics timeStep={1 / 60} interpolate updatePriority={-1} debug={debugPhysics} gravity={[0, -29.43, 0]}>
           <EffectsManager />
           <DebrisSystem />
-          <SparkSystem />
+          <UnifiedVisualEffectsManager />
           <ShockwaveSystem />
 
           {/* Floor */}
-          <RigidBody type="fixed" friction={2}>
+          <RigidBody ccd={true} type="fixed" friction={2}>
             <CuboidCollider args={[25, 0.1, 25]} position={[0, -0.1, 0]} />
           </RigidBody>
 
           {/* Arena Walls */}
-          <RigidBody type="fixed">
-            <CuboidCollider args={[15, 2.5, 0.5]} position={[0, 1.25, -15.5]} />
+          <RigidBody ccd={true} type="fixed" userData={{ role: 'arenaWall', material: 'arenaWall', hitZone: 'arenaWall' }}>
+            <CuboidCollider args={[15, 2.5, 0.5]} position={[0, 1.25, -15.5]} friction={0.9} restitution={0.12} />
             <mesh position={[0, 1.25, -15.5]} receiveShadow castShadow>
               <boxGeometry args={[30, 2.5, 1]} />
               <meshStandardMaterial color="#2d2d2d" roughness={0.9} />
             </mesh>
             
-            <CuboidCollider args={[15, 2.5, 0.5]} position={[0, 1.25, 15.5]} />
+            <CuboidCollider args={[15, 2.5, 0.5]} position={[0, 1.25, 15.5]} friction={0.9} restitution={0.12} />
             <mesh position={[0, 1.25, 15.5]} receiveShadow castShadow>
               <boxGeometry args={[30, 2.5, 1]} />
               <meshStandardMaterial color="#2d2d2d" roughness={0.9} />
             </mesh>
             
-            <CuboidCollider args={[0.5, 2.5, 15]} position={[-15.5, 1.25, 0]} />
+            <CuboidCollider args={[0.5, 2.5, 15]} position={[-15.5, 1.25, 0]} friction={0.9} restitution={0.12} />
             <mesh position={[-15.5, 1.25, 0]} receiveShadow castShadow>
               <boxGeometry args={[1, 2.5, 30]} />
               <meshStandardMaterial color="#2d2d2d" roughness={0.9} />
             </mesh>
             
-            <CuboidCollider args={[0.5, 2.5, 15]} position={[15.5, 1.25, 0]} />
+            <CuboidCollider args={[0.5, 2.5, 15]} position={[15.5, 1.25, 0]} friction={0.9} restitution={0.12} />
             <mesh position={[15.5, 1.25, 0]} receiveShadow castShadow>
               <boxGeometry args={[1, 2.5, 30]} />
               <meshStandardMaterial color="#2d2d2d" roughness={0.9} />
@@ -2006,7 +2692,8 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
 
           {/* Interactive Bots */}
           <Bot 
-            position={[0, 0.1, 6]} 
+            key={matchCount + '-player'}
+            position={[0, 0.5, 6]} 
             color="#444" 
             isSpinning={activeWeapon} 
             isPlayer={true} 
@@ -2014,7 +2701,8 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
             targetRef={opponentRef}
           />
           <Bot 
-            position={[0, 0.1, -6]} 
+            key={matchCount + '-opponent'}
+            position={[0, 0.5, -6]} 
             color="#555" 
             isSpinning={battleStatus === 'battle'} 
             isPlayer={false} 

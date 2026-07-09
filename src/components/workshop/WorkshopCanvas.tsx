@@ -26,12 +26,81 @@ const PartMesh = ({ part, worldPos, worldRot, def }: { part: PlacedBotPart, worl
         </mesh>
       )}
       {def.visualKind === 'cylinder' && (
-        <group rotation={(def as any).type === 'wheel' ? [0, 0, Math.PI / 2] : [0, 0, 0]}>
-          <mesh castShadow receiveShadow>
-            <cylinderGeometry args={[w, w, d, 24]} />
-            <meshStandardMaterial color={color} metalness={0.7} roughness={0.3} />
-          </mesh>
-        </group>
+        part.definitionId === 'weapon_drum' ? (
+          <group name="DrumSpinner" rotation={[0, 0, 0]}>
+            {/* Core Drum Barrel */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+              <cylinderGeometry args={[0.3, 0.3, 0.65, 32]} />
+              <meshStandardMaterial color="#2a2a2a" metalness={0.9} roughness={0.2} />
+            </mesh>
+            {/* Grooves & caps */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]} position={[0.2, 0, 0]}>
+               <cylinderGeometry args={[0.31, 0.31, 0.05, 32]} />
+               <meshStandardMaterial color={color} metalness={0.8} roughness={0.1} />
+            </mesh>
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]} position={[-0.2, 0, 0]}>
+               <cylinderGeometry args={[0.31, 0.31, 0.05, 32]} />
+               <meshStandardMaterial color={color} metalness={0.8} roughness={0.1} />
+            </mesh>
+            {/* 8 staggered sharp cones */}
+            {[
+              { angle: 0, x: -0.22 },
+              { angle: Math.PI / 4, x: -0.11 },
+              { angle: Math.PI / 2, x: 0 },
+              { angle: (3 * Math.PI) / 4, x: 0.11 },
+              { angle: Math.PI, x: 0.22 },
+              { angle: (5 * Math.PI) / 4, x: -0.16 },
+              { angle: (3 * Math.PI) / 2, x: -0.05 },
+              { angle: (7 * Math.PI) / 4, x: 0.16 },
+            ].map((spike, idx) => {
+              const radius = 0.3;
+              const sy = Math.sin(spike.angle) * radius;
+              const sz = Math.cos(spike.angle) * radius;
+              return (
+                <group key={idx} position={[spike.x, sy, sz]} rotation={[spike.angle, 0, 0]}>
+                  <mesh castShadow>
+                    <boxGeometry args={[0.08, 0.06, 0.08]} />
+                    <meshStandardMaterial color="#444" metalness={0.9} roughness={0.2} />
+                  </mesh>
+                  <mesh castShadow position={[0, 0.07, 0]}>
+                    <coneGeometry args={[0.04, 0.12, 4]} />
+                    <meshStandardMaterial color="#ff3300" metalness={0.9} roughness={0.1} emissive="#ff3300" emissiveIntensity={0.2} />
+                  </mesh>
+                </group>
+              );
+            })}
+          </group>
+        ) : (
+          <group name="WheelSpinGroup" rotation={(def.category === 'wheel' || (def as any).type === 'wheel') ? [0, 0, Math.PI / 2] : [0, 0, 0]}>
+            <mesh castShadow receiveShadow>
+              <cylinderGeometry args={[w, w, d, 24]} />
+              <meshStandardMaterial color={color} metalness={0.7} roughness={0.3} />
+            </mesh>
+            {/* Wheel details for premium visual look */}
+            {(def.category === 'wheel' || (def as any).type === 'wheel') && (
+              <>
+                <mesh castShadow position={[0, d / 2 + 0.01, 0]} rotation={[Math.PI / 2, 0, 0]}>
+                  <cylinderGeometry args={[w * 0.4, w * 0.4, 0.05, 8]} />
+                  <meshStandardMaterial color="#555" metalness={0.9} />
+                </mesh>
+                {/* Rolling indicators */}
+                {[0, 1, 2, 3].map((b) => {
+                  const angle = (b * Math.PI) / 2;
+                  return (
+                    <mesh 
+                      key={b} 
+                      castShadow 
+                      position={[Math.cos(angle) * w * 0.6, d / 2 + 0.02, Math.sin(angle) * w * 0.6]}
+                    >
+                      <boxGeometry args={[0.04, 0.03, 0.04]} />
+                      <meshStandardMaterial color="#FFC107" metalness={0.9} />
+                    </mesh>
+                  );
+                })}
+              </>
+            )}
+          </group>
+        )
       )}
       {def.visualKind === 'wedge' && (
         <mesh castShadow receiveShadow>

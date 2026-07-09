@@ -16,7 +16,7 @@ export const TouchControls = ({ onOpenConfig }: { onOpenConfig: () => void }) =>
   const joystickRef = React.useRef<HTMLDivElement>(null);
   const dragging = React.useRef(false);
 
-  const isContinuous = botConfig.weapon.type === 'spinner' || botConfig.weapon.type === 'saw';
+  const isContinuous = botConfig.weapon.type === 'spinner' || botConfig.weapon.type === 'saw' || botConfig.weapon.type === 'drum';
 
   const handleWeaponPress = (active: boolean) => {
     if (battleStatus !== 'battle') return;

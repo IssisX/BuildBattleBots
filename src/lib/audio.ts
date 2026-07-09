@@ -176,27 +176,31 @@ const playThwap = (time: number, outNode: AudioNode, volume: number) => {
 
 const playMetallicClang = (time: number, outNode: AudioNode, freq: number, volume: number) => {
   if (!audioCtx) return;
-  // Complex metallic resonator using multiple oscillators
+  // Crunch/clang resonator
   const gain = audioCtx.createGain();
   gain.gain.setValueAtTime(volume, time);
-  gain.gain.exponentialRampToValueAtTime(0.01, time + 0.8);
+  gain.gain.exponentialRampToValueAtTime(0.01, time + 0.3); // shorter decay
   gain.connect(outNode);
   
-  const ratios = [1.0, 1.6, 2.4, 3.1, 4.2];
+  // Use inharmonic ratios for metal clashing instead of bell-like harmonics
+  const ratios = [1.0, 1.34, 1.77, 2.15, 3.8];
   ratios.forEach((ratio, i) => {
     const osc = audioCtx.createOscillator();
-    osc.type = i % 2 === 0 ? 'sine' : 'square';
+    osc.type = i % 2 === 0 ? 'square' : 'sawtooth'; // harsher waveforms
     osc.frequency.value = freq * ratio;
     
     const pGain = audioCtx.createGain();
-    pGain.gain.value = 1.0 / ratios.length;
+    pGain.gain.value = (1.0 / ratios.length) * (1 - i * 0.1); // lower frequencies louder
     
     osc.connect(pGain);
     pGain.connect(gain);
     
     osc.start(time);
-    osc.stop(time + 0.8);
+    osc.stop(time + 0.3);
   });
+  
+  // Add a noise burst for the crunch
+  playNoiseBurst(time, outNode, volume * 1.5, 0.15, 1200, 'bandpass');
 };
 
 const playWeaponBite = (time: number, outNode: AudioNode, rpm: number, volume: number) => {

@@ -1,0 +1,22 @@
+--- src/components/Arena3D.tsx
++++ src/components/Arena3D.tsx
+@@ -932,6 +932,7 @@
+                }));
+                
+                const targetComp = components[hitZone];
++               const wasDetached = targetComp?.detached;
+                const damageEvent = DamageSystem.processImpact(
+                  now,
+                  myId,
+@@ -945,6 +946,12 @@
+                  targetComp
+                );
+                
++               if (targetComp && !wasDetached && targetComp.detached) {
++                 useGameStore.getState().addLog(`${isPlayer ? 'Opponent' : 'Player'} ${hitZone} component DESTROYED!`, 'critical');
++                 useGameStore.getState().spawnSparks([contactPoint[0], contactPoint[1] + 0.2, contactPoint[2]], 40, '#FF3300');
++                 useGameStore.getState().spawnDebris([contactPoint[0], contactPoint[1] + 0.2, contactPoint[2]], 15);
++               }
++
+                if (damageEvent) damageEvent.damageAmount = baseDamage;
+                useGameStore.getState().processImpactEvent(damageEvent);

@@ -1,4 +1,6 @@
 import { create } from 'zustand';
+import { DamageableComponent, ImpactEvent } from './combat/DamageTypes';
+import { DamageSystem } from './combat/DamageSystem';
 import { db, auth } from './lib/firebase.ts';
 import { doc, getDoc, setDoc, collection, getDocs, deleteDoc, serverTimestamp, writeBatch } from 'firebase/firestore';
 
@@ -162,6 +164,10 @@ interface GameState {
   botConfig: VehicleConfig;
   setBotConfig: (config: VehicleConfig) => void;
   botState: BotState;
+  playerDamageComponents: Record<string, DamageableComponent>;
+  opponentDamageComponents: Record<string, DamageableComponent>;
+  initDamageComponents: () => void;
+  processImpactEvent: (event: ImpactEvent | null) => void;
   setBotState: (state: BotState | ((prev: BotState) => BotState)) => void;
 
   opponentConfig: VehicleConfig;
@@ -173,6 +179,7 @@ interface GameState {
   setBattleStatus: (status: BattleStatus) => void;
   countdown: number;
   setCountdown: (val: number) => void;
+  matchCount: number;
   winner: 'player' | 'opponent' | null;
   setWinner: (winner: 'player' | 'opponent' | null) => void;
 
@@ -548,6 +555,51 @@ export const compileCustomBotStats = (parts: ModularPart[], customName: string =
 };
 
 export const useGameStore = create<GameState>((set, get) => ({
+  playerDamageComponents: {},
+  opponentDamageComponents: {},
+  initDamageComponents: () => set((state) => ({
+    playerDamageComponents: {
+      front: DamageSystem.createDefaultComponent("front", "player", "Front Armor", "front"),
+      left: DamageSystem.createDefaultComponent("left", "player", "Left Armor", "left"),
+      right: DamageSystem.createDefaultComponent("right", "player", "Right Armor", "right"),
+      rear: DamageSystem.createDefaultComponent("rear", "player", "Rear Armor", "rear"),
+      top: DamageSystem.createDefaultComponent("top", "player", "Top Armor", "top"),
+      core: DamageSystem.createDefaultComponent("core", "player", "Core Chassis", "core"),
+    },
+    opponentDamageComponents: {
+      front: DamageSystem.createDefaultComponent("front", "opponent", "Front Armor", "front"),
+      left: DamageSystem.createDefaultComponent("left", "opponent", "Left Armor", "left"),
+      right: DamageSystem.createDefaultComponent("right", "opponent", "Right Armor", "right"),
+      rear: DamageSystem.createDefaultComponent("rear", "opponent", "Rear Armor", "rear"),
+      top: DamageSystem.createDefaultComponent("top", "opponent", "Top Armor", "top"),
+      core: DamageSystem.createDefaultComponent("core", "opponent", "Core Chassis", "core"),
+    }
+  })),
+  processImpactEvent: (event) => {
+    if (!event) return;
+    set((state) => {
+      const components = event.defenderId === 'player' ? { ...state.playerDamageComponents } : { ...state.opponentDamageComponents };
+      
+      let hitZone = 'core';
+      if (Math.abs(event.contactPoint[0]) > Math.abs(event.contactPoint[2])) {
+        hitZone = event.contactPoint[0] > 0 ? 'right' : 'left';
+      } else {
+        hitZone = event.contactPoint[2] > 0 ? 'front' : 'rear';
+      }
+      if (event.contactPoint[1] > 0.5) hitZone = 'top';
+
+      const comp = components[hitZone];
+      if (comp) {
+         components[hitZone] = { ...comp, visualState: comp.visualState }; 
+      }
+      
+      if (event.damageAmount > 0) {
+        setTimeout(() => get().damageBot(event.defenderId as any, event.damageAmount), 0);
+      }
+
+      return event.defenderId === 'player' ? { playerDamageComponents: components } : { opponentDamageComponents: components };
+    });
+  },
   cameraMode: 'follow',
   setCameraMode: (mode) => set({ cameraMode: mode }),
   
@@ -593,6 +645,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   setBattleStatus: (status) => set({ battleStatus: status }),
   countdown: 3,
   setCountdown: (val) => set({ countdown: val }),
+  matchCount: 0,
   winner: null,
   setWinner: (winner) => set({ winner }),
 
@@ -1088,14 +1141,17 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   resetBattle: () => {
-    set({
+    set((state) => ({
       battleStatus: 'menu',
       winner: null,
-      botState: { ...INITIAL_BOT, name: get().botConfig.name },
+      botState: { ...INITIAL_BOT, name: state.botConfig.name },
       opponentState: INITIAL_OPPONENT,
-      debris: []
-    });
+      debris: [],
+      sparks: [],
+      matchCount: state.matchCount + 1
+    }));
     get().clearLogs();
+    get().initDamageComponents();
     get().addLog('Battle simulator reset. Prepare your vehicle.', 'info');
   },
 
@@ -1152,18 +1208,17 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
   spawnSparks: (position, amount, color = "#FFAA00") => {
     const settings = get().settings;
-    
     const isPerf = settings.performanceMode;
-    const maxSparks = settings.maxActiveFragments;
+    const maxSparks = isPerf ? 150 : 500;
 
-    const numSparks = Math.min(amount, settings.maxActiveFragments);
+    const numSparks = amount;
     const newSparks = Array.from({ length: numSparks }).map((_, i) => ({
         id: Math.random().toString() + "s" + i,
         position: [position[0], position[1] + 0.5, position[2]] as [number, number, number],
         velocity: [
-            (Math.random() - 0.5) * 20,
-            Math.random() * 15 + 5,
-            (Math.random() - 0.5) * 20
+            (Math.random() - 0.5) * 30,
+            Math.random() * 25 + 5,
+            (Math.random() - 0.5) * 30
         ] as [number, number, number],
         color,
         timestamp: Date.now()
@@ -1173,13 +1228,24 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   damageBot: (target, amount) => {
     const settings = get().settings;
+    if (amount === undefined || amount === null || isNaN(amount)) {
+      console.warn("[DAMAGE BOT] Received invalid amount:", amount);
+      return;
+    }
     const roundedAmount = Math.round(amount * settings.damageMultiplier);
-    if (get().battleStatus !== 'battle') return;
+    if (get().battleStatus !== 'battle') {
+      console.log(`[DAMAGE BOT] Ignored damage of ${roundedAmount} to ${target} because battle is not active.`);
+      return;
+    }
+
+    console.log(`[DAMAGE BOT] target: ${target}, baseAmount: ${amount}, multiplier: ${settings.damageMultiplier}, finalRoundedAmount: ${roundedAmount}`);
 
     if (target === 'player') {
       const currentHealth = get().botState.health;
       const nextHealth = Math.max(0, currentHealth - roundedAmount);
       const isDestroyed = nextHealth <= 0;
+
+      console.log(`[DAMAGE BOT] Player health transition: ${currentHealth} -> ${nextHealth} (isDestroyed: ${isDestroyed})`);
 
       set((state) => ({
         botState: {
@@ -1204,6 +1270,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       const currentHealth = get().opponentState.health;
       const nextHealth = Math.max(0, currentHealth - roundedAmount);
       const isDestroyed = nextHealth <= 0;
+
+      console.log(`[DAMAGE BOT] Opponent health transition: ${currentHealth} -> ${nextHealth} (isDestroyed: ${isDestroyed})`);
 
       set((state) => ({
         opponentState: {

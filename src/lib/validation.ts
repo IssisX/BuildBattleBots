@@ -180,7 +180,7 @@ export const computePhysicsSummary = (
     bounds: { min, max, size },
     colliderCount,
     stabilityScore: Math.max(0, 100 - (centerOfMass[1] * 100)), // lower CoM is better
-    locomotionReady: config.parts.filter(p => ['wheel'].includes(defMap.get(p.definitionId)?.type || defMap.get(p.definitionId)?.category)).length >= 2,
+    locomotionReady: config.parts.filter(p => ['wheel'].includes((defMap.get(p.definitionId) as any)?.type || defMap.get(p.definitionId)?.category)).length >= 2,
     weaponReady: hasWeapon,
     spawnFit: size[0] < 3 && size[1] < 2 && size[2] < 3
   };

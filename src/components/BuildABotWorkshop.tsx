@@ -22,6 +22,7 @@ export const BuildABotWorkshop = ({ onBack }: { onBack: () => void }) => {
   const addCurrency = useGameStore(s => s.addCurrency);
 
   const [selectedSocketId, setSelectedSocketId] = useState<string | null>(null);
+  const [isLeftPanelCollapsed, setIsLeftPanelCollapsed] = useState(false);
   const [botName, setBotName] = useState<string>(customConfig.name || "Custom Gladiator");
   const [mirrorMode, setMirrorMode] = useState(false);
   const [showAutoBuild, setShowAutoBuild] = useState(false);
@@ -347,12 +348,24 @@ export const BuildABotWorkshop = ({ onBack }: { onBack: () => void }) => {
       </div>
 
       {/* Main Workspace Body - Takes up remaining height */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* LEFT PANEL: Core stats & validation */}
-        <div className="w-80 flex-none bg-[#0a0a0a] border-r border-[#222] flex flex-col overflow-y-auto scrollbar-thin scrollbar-thumb-[#333]">
+      <div className="flex-1 relative overflow-hidden">
+        {/* Full-bleed 3D Assembly Viewport in Background */}
+        <div className="absolute inset-0 bg-[#050505] z-0">
+           <WorkshopCanvas 
+              parts={customConfig.parts} 
+              selectedSocketId={selectedSocketId} 
+              onSelectSocket={setSelectedSocketId} 
+              resolvedTransforms={resolvedTransforms}
+            />
+        </div>
+
+        {/* LEFT PANEL: Floating Core stats & validation */}
+        <div className={`absolute left-4 top-4 bottom-4 w-80 bg-black/85 border border-[#222] backdrop-blur-md rounded-sm shadow-2xl flex flex-col overflow-y-auto scrollbar-thin scrollbar-thumb-[#333] z-10 transition-all duration-300 ease-in-out ${
+          isLeftPanelCollapsed ? "-translate-x-[120%] opacity-0 pointer-events-none" : "translate-x-0 opacity-100"
+        }`}>
           <div className="p-5 flex flex-col gap-5">
             {/* Validation Panel */}
-            <div className="bg-[#121212] border border-[#222] p-4 rounded-sm flex flex-col gap-3">
+            <div className="bg-[#121212]/90 border border-[#222] p-4 rounded-sm flex flex-col gap-3">
               <h3 className="font-mono text-[10px] font-bold tracking-widest text-white/50 uppercase flex items-center gap-1.5 border-b border-[#222] pb-2">
                 <AlertTriangle size={12} className="text-[#FBC02D]" /> SYSTEM VALIDATION
               </h3>
@@ -377,7 +390,7 @@ export const BuildABotWorkshop = ({ onBack }: { onBack: () => void }) => {
             </div>
 
             {/* Live Physics Stats */}
-            <div className="bg-[#121212] border border-[#222] p-4 rounded-sm flex flex-col gap-3">
+            <div className="bg-[#121212]/90 border border-[#222] p-4 rounded-sm flex flex-col gap-3">
               <h3 className="font-mono text-[10px] font-bold tracking-widest text-white/50 uppercase flex items-center gap-1.5 border-b border-[#222] pb-2">
                 <Activity size={12} className="text-[#00E5FF]" /> LIVE KINETIC STATS
               </h3>
@@ -402,7 +415,7 @@ export const BuildABotWorkshop = ({ onBack }: { onBack: () => void }) => {
             </div>
 
             {/* Auto Build System */}
-            <div className="bg-[#121212] border border-[#222] p-4 rounded-sm flex flex-col gap-3">
+            <div className="bg-[#121212]/90 border border-[#222] p-4 rounded-sm flex flex-col gap-3">
               <h3 className="font-mono text-[10px] font-bold tracking-widest text-[#00E5FF] uppercase border-b border-[#222] pb-2 flex items-center gap-2">
                 <Dna size={12} /> AUTO-BUILD GENERATOR
               </h3>
@@ -449,7 +462,7 @@ export const BuildABotWorkshop = ({ onBack }: { onBack: () => void }) => {
             </div>
 
             {/* Core chassis selection */}
-            <div className="bg-[#121212] border border-[#222] p-4 rounded-sm flex flex-col gap-3">
+            <div className="bg-[#121212]/90 border border-[#222] p-4 rounded-sm flex flex-col gap-3">
               <h3 className="font-mono text-[10px] font-bold tracking-widest text-white/50 uppercase border-b border-[#222] pb-2">
                 1. SELECT BASE CHASSIS
               </h3>
@@ -479,192 +492,193 @@ export const BuildABotWorkshop = ({ onBack }: { onBack: () => void }) => {
           </div>
         </div>
 
-        {/* MIDDLE PANEL: 3D Assembly Viewport */}
-        <div className="flex-1 relative flex flex-col min-w-[300px]">
-          <div className="absolute inset-0 bg-[#050505]">
-             <WorkshopCanvas 
-                parts={customConfig.parts} 
-                selectedSocketId={selectedSocketId} 
-                onSelectSocket={setSelectedSocketId} 
-                resolvedTransforms={resolvedTransforms}
-              />
-          </div>
-          {/* Overlay UI */}
-          <div className="absolute top-4 left-4 right-4 flex justify-between pointer-events-none">
-            <h3 className="font-mono text-xs font-bold tracking-widest text-white/50 uppercase flex items-center gap-2 drop-shadow-md">
+        {/* HUD Controls Overlay on 3D Viewport */}
+        <div className="absolute top-4 left-4 right-4 flex justify-between pointer-events-none z-20">
+          <div className="pointer-events-auto flex items-center gap-2">
+            <button 
+              onClick={() => setIsLeftPanelCollapsed(!isLeftPanelCollapsed)}
+              className="font-mono text-[9px] bg-black/60 hover:bg-black/95 text-white/70 px-2.5 py-1.5 border border-white/20 uppercase flex items-center gap-1 cursor-pointer transition-colors backdrop-blur-sm rounded-sm"
+              title={isLeftPanelCollapsed ? "Show Stats & Selection Panel" : "Hide Stats & Selection Panel"}
+            >
+              {isLeftPanelCollapsed ? "→ SHOW STATS" : "← HIDE STATS"}
+            </button>
+            <h3 className="font-mono text-xs font-bold tracking-widest text-white/50 uppercase flex items-center gap-2 drop-shadow-md hidden md:flex font-mono">
               <Eye size={14} className="text-[#FF5500]" /> 2. Tactical Assembly Schematic
             </h3>
-            <div className="pointer-events-auto">
-              {corePart && (
-                <button 
-                  onClick={() => setSelectedSocketId('core_paint')}
-                  className="font-mono text-[9px] bg-black/60 hover:bg-black/90 text-white/70 px-3 py-1 border border-white/20 uppercase flex items-center gap-1 cursor-pointer transition-colors backdrop-blur-sm rounded-sm"
-                >
-                  <Palette size={10} /> PAINT CORE
-                </button>
-              )}
-            </div>
           </div>
-          <p className="absolute bottom-4 inset-x-0 text-[10px] font-mono text-white/40 text-center leading-normal drop-shadow-md pointer-events-none">
+          <div className="pointer-events-auto">
+            {corePart && (
+              <button 
+                onClick={() => setSelectedSocketId('core_paint')}
+                className="font-mono text-[9px] bg-black/60 hover:bg-black/90 text-white/70 px-3 py-1.5 border border-white/20 uppercase flex items-center gap-1 cursor-pointer transition-colors backdrop-blur-sm rounded-sm"
+              >
+                <Palette size={10} /> PAINT CORE
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Thin bottom control guide, replaces the large floating "awaiting socket" tooltip */}
+        <div className="absolute bottom-4 inset-x-0 flex flex-col items-center gap-1.5 pointer-events-none z-20">
+          <div className="bg-black/75 border border-white/10 px-4 py-1.5 rounded-full flex items-center gap-2 backdrop-blur-sm shadow-md">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#FF5500] animate-ping" />
+            <span className="font-mono text-[9px] text-white/80 tracking-widest uppercase">
+              {selectedSocketId 
+                ? "Active Socket Loaded • Customize Hardware"
+                : "Select a glowing node on the gladiator blueprint to install weapons & armor"}
+            </span>
+          </div>
+          <p className="text-[9px] font-mono text-white/40 text-center leading-none uppercase tracking-wider drop-shadow-md">
             ▲ DRAG TO ROTATE • SCROLL TO ZOOM • CLICK GLOWING SOCKETS TO MOUNT
           </p>
         </div>
 
-        {/* RIGHT PANEL: Parts catalog */}
-        <div className="w-80 flex-none bg-[#0a0a0a] border-l border-[#222] flex flex-col overflow-y-auto scrollbar-thin scrollbar-thumb-[#333]">
-          <div className="p-5 flex flex-col gap-5">
-            <h3 className="font-mono text-[10px] font-bold tracking-widest text-white/50 uppercase border-b border-[#222] pb-2">
-                3. MODULE CONFIGURATION
-            </h3>
-            
-            {selectedSocketId === 'core_paint' ? (
-              <div className="bg-[#121212] border border-[#222] p-4 rounded-sm space-y-4">
-                <div>
-                  <h4 className="font-sans font-bold text-sm text-white uppercase">PAINT CORE PLATING</h4>
-                  <p className="text-[11px] text-white/50 mt-1">Select a solid industrial finish for the main structural core.</p>
-                </div>
-                <div className="grid grid-cols-4 gap-2 bg-[#181818] p-3 border border-[#222] rounded-sm">
-                  {presetColors.map(color => (
-                    <button
-                      key={color}
-                      onClick={() => handlePaintCore(color)}
-                      className={`h-8 rounded-sm border hover:scale-105 transition-transform ${
-                        corePart?.color === color ? "border-white border-2" : "border-white/10"
-                      }`}
-                      style={{ backgroundColor: color }}
-                    />
-                  ))}
-                </div>
-                <button
+        {/* RIGHT PANEL: Floating Parts catalog & Module Configuration */}
+        {selectedSocketId !== null && (
+          <div className="absolute right-4 top-4 bottom-4 w-80 bg-black/85 border border-[#222] backdrop-blur-md rounded-sm shadow-2xl flex flex-col overflow-y-auto scrollbar-thin scrollbar-thumb-[#333] z-10 animate-in slide-in-from-right duration-300">
+            <div className="p-5 flex flex-col gap-5">
+              <div className="flex justify-between items-center border-b border-[#222] pb-2">
+                <h3 className="font-mono text-[10px] font-bold tracking-widest text-white/50 uppercase">
+                    3. MODULE CONFIGURATION
+                </h3>
+                <button 
                   onClick={() => setSelectedSocketId(null)}
-                  className="w-full py-2 bg-[#222] hover:bg-[#2a2a2a] border border-[#333] text-white font-mono text-[10px] uppercase tracking-wider rounded-sm cursor-pointer"
+                  className="text-white/40 hover:text-white font-mono text-[9px] border border-white/10 hover:border-white/30 px-1.5 py-0.5 rounded uppercase cursor-pointer transition-colors"
                 >
-                  CLOSE COLOR PALETTE
+                  CLOSE [X]
                 </button>
               </div>
-            ) : activeSocketInfo?.socket ? (
-              <div className="bg-[#121212] border border-[#222] p-4 rounded-sm flex flex-col gap-4">
-                <div>
-                  <span className="font-mono text-[8px] text-[#FF5500] font-bold tracking-widest uppercase">SOCKET DESCRIPTOR</span>
-                  <h4 className="font-sans font-bold text-sm text-white uppercase mt-0.5">
-                    {activeSocketInfo.socket.id.replace("_", " ")}
-                  </h4>
-                  <div className="flex items-center gap-1 text-[9px] text-white/40 mt-1 font-mono uppercase">
-                    <span>REQUIRES TYPE:</span>
-                    <span className="text-[#00E5FF] font-bold">{activeSocketInfo.socket.socketType}</span>
+              
+              {selectedSocketId === 'core_paint' ? (
+                <div className="bg-[#121212]/90 border border-[#222] p-4 rounded-sm space-y-4">
+                  <div>
+                    <h4 className="font-sans font-bold text-sm text-white uppercase">PAINT CORE PLATING</h4>
+                    <p className="text-[11px] text-white/50 mt-1">Select a solid industrial finish for the main structural core.</p>
                   </div>
+                  <div className="grid grid-cols-4 gap-2 bg-[#181818] p-3 border border-[#222] rounded-sm">
+                    {presetColors.map(color => (
+                      <button
+                        key={color}
+                        onClick={() => handlePaintCore(color)}
+                        className={`h-8 rounded-sm border hover:scale-105 transition-transform ${
+                          corePart?.color === color ? "border-white border-2" : "border-white/10"
+                        }`}
+                        style={{ backgroundColor: color }}
+                      />
+                    ))}
+                  </div>
+                  <button
+                    onClick={() => setSelectedSocketId(null)}
+                    className="w-full py-2 bg-[#222] hover:bg-[#2a2a2a] border border-[#333] text-white font-mono text-[10px] uppercase tracking-wider rounded-sm cursor-pointer"
+                  >
+                    CLOSE COLOR PALETTE
+                  </button>
                 </div>
-
-                {attachedPart ? (
-                  <div className="bg-[#181818] border border-[#2c2d33] p-3 rounded-sm flex flex-col gap-3">
-                    <div className="flex justify-between items-start">
-                      <div>
-                        <span className="font-mono text-[8px] text-[#00E676] font-bold uppercase tracking-wider">ATTACHED INTERLOCK</span>
-                        <h5 className="font-sans font-bold text-xs text-white uppercase mt-0.5">
-                          {PART_TEMPLATES.find(t => t.templateId === attachedPart.definitionId)?.label}
-                        </h5>
-                      </div>
-                      <button 
-                        onClick={handleUninstallPart}
-                        className="p-1.5 bg-red-950/20 text-red-400 hover:text-red-300 hover:bg-red-900/30 border border-red-900/40 rounded-sm cursor-pointer"
-                        title="Dismantle Part"
-                      >
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                    
-                    <div className="border-t border-[#222] pt-2 mt-1">
-                      <span className="font-mono text-[8px] text-white/40 uppercase block mb-1">MODULE PAINT</span>
-                      <div className="flex flex-wrap gap-1.5">
-                        {presetColors.map(color => (
-                          <button
-                            key={color}
-                            onClick={() => handlePaintPart(color)}
-                            className={`w-5 h-5 rounded-sm border ${
-                              attachedPart.color === color ? "border-white border-2" : "border-white/10 hover:border-white/30"
-                            }`}
-                            style={{ backgroundColor: color }}
-                          />
-                        ))}
-                      </div>
+              ) : activeSocketInfo?.socket ? (
+                <div className="bg-[#121212]/90 border border-[#222] p-4 rounded-sm flex flex-col gap-4">
+                  <div>
+                    <span className="font-mono text-[8px] text-[#FF5500] font-bold tracking-widest uppercase font-mono">SOCKET DESCRIPTOR</span>
+                    <h4 className="font-sans font-bold text-sm text-white uppercase mt-0.5">
+                      {activeSocketInfo.socket.id.replace("_", " ")}
+                    </h4>
+                    <div className="flex items-center gap-1 text-[9px] text-white/40 mt-1 font-mono uppercase">
+                      <span>REQUIRES TYPE:</span>
+                      <span className="text-[#00E5FF] font-bold">{activeSocketInfo.socket.socketType}</span>
                     </div>
                   </div>
-                ) : (
-                  <div className="bg-[#181818]/50 border border-dashed border-[#333] p-4 rounded-sm text-center">
-                    <Wrench className="mx-auto text-white/20 mb-2" size={20} />
-                    <p className="font-sans text-[10px] text-white/40 leading-relaxed">
-                      This connector node is vacant. Select an industrial component to mount it.
-                    </p>
-                  </div>
-                )}
 
-                <div className="flex flex-col gap-2 border-t border-[#222] pt-4">
-                  <span className="font-mono text-[9px] text-white/40 tracking-wider uppercase block">COMPATIBLE HARDWARE</span>
-                  <div className="flex flex-col gap-2">
-                    {compatibleTemplates.map((template) => {
-                      const isInstalled = attachedPart?.definitionId === template.templateId;
-                      const hasEnoughCr = currency >= template.cost;
-                      
-                      return (
-                        <div 
-                          key={template.templateId}
-                          className={`p-3 border rounded-sm flex flex-col gap-2 ${
-                            isInstalled ? "bg-[#1976D2]/10 border-[#1976D2]/40" : "bg-[#151515] border-[#222]"
-                          }`}
-                        >
-                          <div className="flex justify-between items-start">
-                            <span className="font-sans text-[11px] font-bold text-white uppercase">{template.label}</span>
-                            {template.cost > 0 && (
-                              <span className="font-mono text-[8px] text-[#FBC02D] font-bold">{template.cost} CR</span>
-                            )}
-                          </div>
-                          <p className="text-[9px] text-white/40 leading-tight">{template.description}</p>
-                          
-                          <div className="mt-1 flex justify-end">
-                            {isInstalled ? (
-                              <span className="font-mono text-[8px] text-[#448AFF] uppercase font-bold">INSTALLED</span>
-                            ) : (
-                              <button
-                                disabled={!hasEnoughCr}
-                                onClick={() => handleInstallPart(template)}
-                                className={`px-3 py-1.5 rounded-sm font-mono font-bold text-[8px] uppercase ${
-                                  hasEnoughCr
-                                    ? "bg-[#FF5500] hover:bg-[#FF7722] text-white cursor-pointer"
-                                    : "bg-[#222] border border-[#333] text-white/25 cursor-not-allowed"
-                                }`}
-                              >
-                                MOUNT
-                              </button>
-                            )}
-                          </div>
+                  {attachedPart ? (
+                    <div className="bg-[#181818]/90 border border-[#2c2d33] p-3 rounded-sm flex flex-col gap-3">
+                      <div className="flex justify-between items-start">
+                        <div>
+                          <span className="font-mono text-[8px] text-[#00E676] font-bold uppercase tracking-wider">ATTACHED INTERLOCK</span>
+                          <h5 className="font-sans font-bold text-xs text-white uppercase mt-0.5">
+                            {PART_TEMPLATES.find(t => t.templateId === attachedPart.definitionId)?.label}
+                          </h5>
                         </div>
-                      );
-                    })}
+                        <button 
+                          onClick={handleUninstallPart}
+                          className="p-1.5 bg-red-950/20 text-red-400 hover:text-red-300 hover:bg-red-900/30 border border-red-900/40 rounded-sm cursor-pointer"
+                          title="Dismantle Part"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                      
+                      <div className="border-t border-[#222] pt-2 mt-1">
+                        <span className="font-mono text-[8px] text-white/40 uppercase block mb-1">MODULE PAINT</span>
+                        <div className="flex flex-wrap gap-1.5">
+                          {presetColors.map(color => (
+                            <button
+                              key={color}
+                              onClick={() => handlePaintPart(color)}
+                              className={`w-5 h-5 rounded-sm border ${
+                                attachedPart.color === color ? "border-white border-2" : "border-white/10 hover:border-white/30"
+                              }`}
+                              style={{ backgroundColor: color }}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="bg-[#181818]/50 border border-dashed border-[#333] p-4 rounded-sm text-center">
+                      <Wrench className="mx-auto text-white/20 mb-2" size={20} />
+                      <p className="font-sans text-[10px] text-white/40 leading-relaxed">
+                        This connector node is vacant. Select an industrial component to mount it.
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="flex flex-col gap-2 border-t border-[#222] pt-4">
+                    <span className="font-mono text-[9px] text-white/40 tracking-wider uppercase block">COMPATIBLE HARDWARE</span>
+                    <div className="flex flex-col gap-2">
+                      {compatibleTemplates.map((template) => {
+                        const isInstalled = attachedPart?.definitionId === template.templateId;
+                        const hasEnoughCr = currency >= template.cost;
+                        
+                        return (
+                          <div 
+                            key={template.templateId}
+                            className={`p-3 border rounded-sm flex flex-col gap-2 ${
+                              isInstalled ? "bg-[#1976D2]/10 border-[#1976D2]/40" : "bg-[#151515] border-[#222]"
+                            }`}
+                          >
+                            <div className="flex justify-between items-start">
+                              <span className="font-sans text-[11px] font-bold text-white uppercase">{template.label}</span>
+                              {template.cost > 0 && (
+                                <span className="font-mono text-[8px] text-[#FBC02D] font-bold">{template.cost} CR</span>
+                              )}
+                            </div>
+                            <p className="text-[9px] text-white/40 leading-tight">{template.description}</p>
+                            
+                            <div className="mt-1 flex justify-end">
+                              {isInstalled ? (
+                                <span className="font-mono text-[8px] text-[#448AFF] uppercase font-bold">INSTALLED</span>
+                              ) : (
+                                <button
+                                  disabled={!hasEnoughCr}
+                                  onClick={() => handleInstallPart(template)}
+                                  className={`px-3 py-1.5 rounded-sm font-mono font-bold text-[8px] uppercase ${
+                                    hasEnoughCr
+                                      ? "bg-[#FF5500] hover:bg-[#FF7722] text-white cursor-pointer"
+                                      : "bg-[#222] border border-[#333] text-white/25 cursor-not-allowed"
+                                  }`}
+                                >
+                                  MOUNT
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 </div>
-              </div>
-            ) : (
-              <div className="flex flex-col items-center justify-center text-center py-12 px-4 bg-[#121212] border border-[#222] rounded-sm">
-                <Wrench className="text-[#FF5500]/40 animate-pulse mb-3" size={24} />
-                <h4 className="font-sans font-bold text-[11px] text-white uppercase tracking-wider">Awaiting Socket</h4>
-                <p className="font-sans text-[10px] text-white/40 leading-relaxed mt-2">
-                  Please click any glowing socket on the blueprint schematic to configure parts.
-                </p>
-                {customConfig.parts.length <= 1 && (
-                  <div className="mt-6 p-3 border border-[#00E5FF]/20 bg-[#00E5FF]/5 rounded-sm">
-                    <p className="font-sans text-[10px] text-[#00E5FF]/80 mb-2">Want to jump right into the action?</p>
-                    <button 
-                      onClick={handleAutoBuild}
-                      className="px-4 py-1.5 bg-[#00E5FF]/10 hover:bg-[#00E5FF]/20 text-[#00E5FF] border border-[#00E5FF]/30 font-mono text-[10px] font-bold tracking-wider uppercase rounded-sm transition-colors flex items-center justify-center gap-2 mx-auto"
-                    >
-                      <Dna size={12} /> USE AUTO-BUILDER
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
+              ) : null}
+            </div>
           </div>
-        </div>
+        )}
       </div>
     </motion.div>
   );
