@@ -13,11 +13,12 @@ export type CombatMaterial = {
   name: 'steel' | 'aluminum' | 'rubber' | 'armorPlate' | 'weaponSteel' | 'composite' | 'arenaWall';
   hardness: number;
   density: number;
-  ringHz: number;           // resonance for audio
+  ringHz: number;
   ringDamping: number;
   sparkYield: number;
   scrapeResistance: number;
-  deflectAngleBias: number; // slippery vs grabby surfaces
+  deflectAngleBias: number;
+  deformation: import('../types').MaterialDeformationProfile;
 };
 
 export type DamageLayer = {
@@ -38,6 +39,8 @@ export type CrackNode = { x: number; y: number; z: number; energy: number; linke
 
 export type DamageableComponent = {
   componentId: number;
+  partInstanceId?: string;
+  partDefinitionId?: string;
   botId: string;
   label: string;
   hitZone: string;
@@ -79,6 +82,7 @@ export type ImpactEvent = {
   materialB: number;
   manifoldContacts: number;
   damageAmount?: number;
+  dentRequest?: import('../types').DentRequest;
   seedRoll: number;            // deterministic per-event random draw
 };
 
@@ -124,11 +128,11 @@ export const DamageTuning = {
 };
 
 export const Materials: Record<string, CombatMaterial> = {
-  steel: { id: 0, name: 'steel', hardness: 1.0, density: 7850, ringHz: 1200, ringDamping: 0.02, sparkYield: 0.8, scrapeResistance: 0.7, deflectAngleBias: 0.0 },
-  aluminum: { id: 1, name: 'aluminum', hardness: 0.6, density: 2700, ringHz: 1800, ringDamping: 0.05, sparkYield: 0.3, scrapeResistance: 0.4, deflectAngleBias: 0.1 },
-  rubber: { id: 2, name: 'rubber', hardness: 0.1, density: 1100, ringHz: 0, ringDamping: 1.0, sparkYield: 0, scrapeResistance: 0.1, deflectAngleBias: 0.5 },
-  armorPlate: { id: 3, name: 'armorPlate', hardness: 1.5, density: 8000, ringHz: 800, ringDamping: 0.01, sparkYield: 1.0, scrapeResistance: 0.9, deflectAngleBias: -0.1 },
-  weaponSteel: { id: 4, name: 'weaponSteel', hardness: 1.8, density: 7900, ringHz: 1000, ringDamping: 0.01, sparkYield: 0.9, scrapeResistance: 0.95, deflectAngleBias: -0.1 },
-  composite: { id: 5, name: 'composite', hardness: 0.8, density: 1600, ringHz: 500, ringDamping: 0.2, sparkYield: 0.1, scrapeResistance: 0.8, deflectAngleBias: 0.2 },
-  arenaWall: { id: 6, name: 'arenaWall', hardness: 2.0, density: 10000, ringHz: 400, ringDamping: 0.1, sparkYield: 0.5, scrapeResistance: 1.0, deflectAngleBias: 0.0 },
+  steel: {  id: 0, name: 'steel', hardness: 1.0, density: 7850, ringHz: 1200, ringDamping: 0.02, sparkYield: 0.8, scrapeResistance: 0.7, deflectAngleBias: 0.0 , deformation: {"dentThreshold":10,"fullDentEnergy":100,"minimumDentRadius":0.1,"maximumDentRadius":0.3,"maximumDentDepth":0.1,"elasticity":0.05,"plasticity":0.95,"constraintStiffness":0.8} },
+  aluminum: {  id: 1, name: 'aluminum', hardness: 0.6, density: 2700, ringHz: 1800, ringDamping: 0.05, sparkYield: 0.3, scrapeResistance: 0.4, deflectAngleBias: 0.1 , deformation: {"dentThreshold":5,"fullDentEnergy":50,"minimumDentRadius":0.15,"maximumDentRadius":0.4,"maximumDentDepth":0.15,"elasticity":0.02,"plasticity":0.98,"constraintStiffness":0.6} },
+  rubber: {  id: 2, name: 'rubber', hardness: 0.1, density: 1100, ringHz: 0, ringDamping: 1.0, sparkYield: 0, scrapeResistance: 0.1, deflectAngleBias: 0.5 , deformation: {"dentThreshold":100,"fullDentEnergy":1000,"minimumDentRadius":0.2,"maximumDentRadius":0.5,"maximumDentDepth":0.05,"elasticity":0.95,"plasticity":0.05,"constraintStiffness":0.2} },
+  armorPlate: {  id: 3, name: 'armorPlate', hardness: 1.5, density: 8000, ringHz: 800, ringDamping: 0.01, sparkYield: 1.0, scrapeResistance: 0.9, deflectAngleBias: -0.1 , deformation: {"dentThreshold":30,"fullDentEnergy":200,"minimumDentRadius":0.05,"maximumDentRadius":0.25,"maximumDentDepth":0.05,"elasticity":0.1,"plasticity":0.9,"constraintStiffness":0.95} },
+  weaponSteel: {  id: 4, name: 'weaponSteel', hardness: 1.8, density: 7900, ringHz: 1000, ringDamping: 0.01, sparkYield: 0.9, scrapeResistance: 0.95, deflectAngleBias: -0.1 , deformation: {"dentThreshold":40,"fullDentEnergy":250,"minimumDentRadius":0.05,"maximumDentRadius":0.2,"maximumDentDepth":0.04,"elasticity":0.1,"plasticity":0.9,"constraintStiffness":0.95} },
+  composite: {  id: 5, name: 'composite', hardness: 0.8, density: 1600, ringHz: 500, ringDamping: 0.2, sparkYield: 0.1, scrapeResistance: 0.8, deflectAngleBias: 0.2 , deformation: {"dentThreshold":15,"fullDentEnergy":80,"minimumDentRadius":0.1,"maximumDentRadius":0.35,"maximumDentDepth":0.1,"elasticity":0.01,"plasticity":0.99,"constraintStiffness":0.85} },
+  arenaWall: {  id: 6, name: 'arenaWall', hardness: 2.0, density: 10000, ringHz: 400, ringDamping: 0.1, sparkYield: 0.5, scrapeResistance: 1.0, deflectAngleBias: 0.0 , deformation: {"dentThreshold":200,"fullDentEnergy":1000,"minimumDentRadius":0.05,"maximumDentRadius":0.2,"maximumDentDepth":0.02,"elasticity":0.05,"plasticity":0.95,"constraintStiffness":0.99} },
 };

@@ -26,6 +26,7 @@ export const BuildABotWorkshop = ({ onBack }: { onBack: () => void }) => {
   const [botName, setBotName] = useState<string>(customConfig.name || "Custom Gladiator");
   const [mirrorMode, setMirrorMode] = useState(false);
   const [showAutoBuild, setShowAutoBuild] = useState(false);
+  const [diagnosticsMode, setDiagnosticsMode] = useState(false);
   const [autoBuildArchetype, setAutoBuildArchetype] = useState<AutoBuildArchetype>('balanced');
   const [lastManualConfig, setLastManualConfig] = useState<CustomBotConfig | null>(null);
 
@@ -298,8 +299,8 @@ export const BuildABotWorkshop = ({ onBack }: { onBack: () => void }) => {
       {/* Header */}
       <div className="flex-none p-4 md:p-6 bg-[#0A0A0A] border-b border-[#222] flex flex-col md:flex-row justify-between items-start md:items-center gap-4 relative z-20">
         <div className="flex items-center gap-4">
-          <button 
-            onClick={onBack}
+          <button onClick={() => setDiagnosticsMode(!diagnosticsMode)} className={`px-3 py-1 font-mono text-[10px] rounded ${diagnosticsMode ? 'bg-[#FF5500]/20 text-[#FF5500] border border-[#FF5500]/50' : 'bg-black text-white/50 border border-white/10'}`}>DIAGNOSTICS</button>
+          <button onClick={onBack}
             className="flex items-center justify-center p-2 rounded-sm bg-[#1A1A1A] border border-[#333] hover:border-white/40 text-white/70 hover:text-white transition-all cursor-pointer"
           >
             <ChevronRight className="rotate-180" size={16} />
@@ -355,6 +356,16 @@ export const BuildABotWorkshop = ({ onBack }: { onBack: () => void }) => {
               parts={customConfig.parts} 
               selectedSocketId={selectedSocketId} 
               onSelectSocket={setSelectedSocketId} 
+              onSelectPart={(instanceId) => {
+                const part = customConfig.parts.find(p => p.instanceId === instanceId);
+                if (part) {
+                  if (part.parentInstanceId && part.parentSocketId) {
+                    setSelectedSocketId(`${part.parentInstanceId}:${part.parentSocketId}`);
+                  } else {
+                    setSelectedSocketId('core_paint');
+                  }
+                }
+              }}
               resolvedTransforms={resolvedTransforms}
             />
         </div>

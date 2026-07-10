@@ -1,13 +1,23 @@
-import React, { useRef, useState, useEffect, useMemo } from 'react';
+import React, { useRef, useState, useEffect, useMemo, createContext, useContext } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls, Grid, Environment, ContactShadows, KeyboardControls, useKeyboardControls } from '@react-three/drei';
 import * as THREE from 'three';
-import { Physics, RigidBody, CuboidCollider, CylinderCollider } from '@react-three/rapier';
+import { Physics, RigidBody, CuboidCollider, CylinderCollider, CapsuleCollider } from '@react-three/rapier';
 import { DamageSystem } from "../combat/DamageSystem";
+import { globalDeformation } from '../lib/deformation';
 import { useGameStore, CameraMode } from '../store';
 import { resolvePartTransforms, resolvePartTransformsV2, PART_TEMPLATES } from '../lib/partsCatalog';
 import { playImpactSound, initAudio } from '../lib/audio';
-import { ImpactEvent, ImpactClass, BotAnimState } from '../types';
+import { ImpactEvent, ImpactClass, BotAnimState, CombatMechanicalState, BotControlIntent, ImpactLoadPacket } from '../types';
+import { finalizeAssemblyPlan } from '../lib/assembly';
+import { 
+  initializeCombatMechanicalState, 
+  resolveGroundSupports, 
+  updateWheelGroundDynamics, 
+  updateWeaponDynamicsAndMomentum, 
+  propagateImpactLoad, 
+  evaluateMobilityAndKnockout 
+} from '../lib/combatMechanics';
 
 declare global {
   interface Window {
@@ -22,33 +32,449 @@ export const globalPhysicsState = {
   opponent: { vel: new THREE.Vector3(), pos: new THREE.Vector3(), mass: 1, animState: "idle" as BotAnimState, lastHitTime: 0, hitNormal: new THREE.Vector3() }
 };
 
-const WedgeMesh = ({ size, color }: { size: [number, number, number]; color: string }) => {
-  const [width, height, depth] = size;
-  const geom = useMemo(() => {
-    const shape = new THREE.Shape();
-    // Profile on Z-Y plane: right triangle (wedge)
-    shape.moveTo(-depth / 2, -height / 2);
-    shape.lineTo(depth / 2, -height / 2);
-    shape.lineTo(-depth / 2, height / 2);
-    shape.closePath();
+export const globalMechanicalState = {
+  player: { current: null as CombatMechanicalState | null },
+  opponent: { current: null as CombatMechanicalState | null }
+};
 
-    const extrudeSettings = {
-      depth: width,
-      bevelEnabled: false
+export const DamageContext = createContext<number>(0);
+export const BotOwnerContext = createContext<string>('player');
+
+const DeformableMesh = ({
+  geometry,
+  color,
+  metalness = 0.8,
+  roughness = 0.2,
+  emissive = '#000000',
+  emissiveIntensity = 0,
+  children
+}: {
+  geometry: THREE.BufferGeometry;
+  color: string;
+  metalness?: number;
+  roughness?: number;
+  emissive?: string;
+  emissiveIntensity?: number;
+  children?: React.ReactNode;
+}) => {
+  const ownerId = useContext(BotOwnerContext);
+  const battleStatus = useGameStore(s => s.battleStatus);
+  const meshRef = useRef<THREE.Mesh>(null);
+
+  // Maintain unique cloned geometry per instance so damage affects only this specific panel/part
+  const [activeGeom, setActiveGeom] = useState<THREE.BufferGeometry | null>(null);
+
+  // Ref to hold the Verlet integration physics state
+  const verletStateRef = useRef<{
+    positions: Float32Array;      // current positions: x, y, z
+    prevPositions: Float32Array;  // previous positions for velocity tracking
+    restPositions: Float32Array;  // plastic rest/equilibrium positions
+    neighbors: Set<number>[];     // mesh topology adjacency list
+    active: boolean;              // is the simulation currently executing?
+    settleTimer: number;          // cooldown timer to put the simulation to sleep when settled
+  } | null>(null);
+
+  useEffect(() => {
+    const cloned = geometry.clone();
+    
+    // Create vertex colors attribute if not present
+    if (!cloned.attributes.color) {
+      const posAttr = cloned.attributes.position;
+      const colors = new Float32Array(posAttr.count * 3);
+      colors.fill(1.0); // Start with white so the material color multipliers act as default
+      cloned.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    }
+    
+    const posAttr = cloned.attributes.position;
+    const count = posAttr.count;
+    const neighbors: Set<number>[] = Array.from({ length: count }, () => new Set<number>());
+
+    // Build the mesh topology adjacency list (neighbors)
+    if (cloned.index) {
+      const indices = cloned.index.array;
+      for (let i = 0; i < indices.length; i += 3) {
+        const a = indices[i];
+        const b = indices[i+1];
+        const c = indices[i+2];
+        if (a < count && b < count && c < count) {
+          neighbors[a].add(b); neighbors[a].add(c);
+          neighbors[b].add(a); neighbors[b].add(c);
+          neighbors[c].add(a); neighbors[c].add(b);
+        }
+      }
+    } else {
+      for (let i = 0; i < count; i += 3) {
+        if (i + 2 < count) {
+          neighbors[i].add(i+1); neighbors[i].add(i+2);
+          neighbors[i+1].add(i); neighbors[i+1].add(i+2);
+          neighbors[i+2].add(i); neighbors[i+2].add(i+1);
+        }
+      }
+    }
+
+    const positions = posAttr.array as Float32Array;
+    const currentPositions = positions; // Mutate buffer array in-place for high-performance updates
+    const prevPositions = currentPositions.slice(); // copy
+    const restPositions = currentPositions.slice(); // copy
+
+    verletStateRef.current = {
+      positions: currentPositions,
+      prevPositions,
+      restPositions,
+      neighbors,
+      active: false,
+      settleTimer: 0
     };
-    const g = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-    g.center();
-    // Rotate to align extrusion along X axis
-    g.rotateY(Math.PI / 2);
-    return g;
-  }, [width, height, depth]);
+
+    setActiveGeom(cloned);
+
+    return () => {
+      cloned.dispose();
+    };
+  }, [geometry, battleStatus]); // Re-clone on reset, erasing combat deformation dynamically
+
+  // Verlet physics simulation integration loop
+  useFrame((state, delta) => {
+    if (!activeGeom || !verletStateRef.current || !verletStateRef.current.active) return;
+
+    const vs = verletStateRef.current;
+    vs.settleTimer -= delta;
+    if (vs.settleTimer <= 0) {
+      vs.active = false;
+      return;
+    }
+
+    const posAttr = activeGeom.attributes.position;
+    const positions = posAttr.array as Float32Array;
+    const count = posAttr.count;
+
+    const dt = Math.min(0.016, delta); // bound time step for stability
+    const metalDamping = 0.82; // damping coefficient of metal structure
+    const k_elastic = 18.0;   // elastic spring coefficient
+    const elasticLimit = 0.045; // threshold of elastic stretch before plastic deformation occurs
+    const plasticYield = 0.48; // rate of permanent plastic deformation yield
+
+    // 1. Verlet integration step
+    for (let i = 0; i < count; i++) {
+      const idx = i * 3;
+      // Velocity = current - previous
+      const vx = positions[idx] - vs.prevPositions[idx];
+      const vy = positions[idx+1] - vs.prevPositions[idx+1];
+      const vz = positions[idx+2] - vs.prevPositions[idx+2];
+
+      // Save current positions to previous positions array
+      vs.prevPositions[idx] = positions[idx];
+      vs.prevPositions[idx+1] = positions[idx+1];
+      vs.prevPositions[idx+2] = positions[idx+2];
+
+      // Spring restoring force back to rest positions
+      const rx = vs.restPositions[idx] - positions[idx];
+      const ry = vs.restPositions[idx+1] - positions[idx+1];
+      const rz = vs.restPositions[idx+2] - positions[idx+2];
+
+      const dist = Math.sqrt(rx * rx + ry * ry + rz * rz);
+
+      // Plastic yield model: if deformed beyond limit, rest position is permanently shifted (plastic flow)
+      if (dist > elasticLimit) {
+        const excess = dist - elasticLimit;
+        const shiftX = (rx / dist) * excess * plasticYield;
+        const shiftY = (ry / dist) * excess * plasticYield;
+        const shiftZ = (rz / dist) * excess * plasticYield;
+
+        vs.restPositions[idx] -= shiftX;
+        vs.restPositions[idx+1] -= shiftY;
+        vs.restPositions[idx+2] -= shiftZ;
+      }
+
+      // Acceleration towards rest position
+      const ax = rx * k_elastic;
+      const ay = ry * k_elastic;
+      const az = rz * k_elastic;
+
+      // Verlet update: x_next = x + v * damping + a * dt^2
+      positions[idx] += vx * metalDamping + ax * dt * dt;
+      positions[idx+1] += vy * metalDamping + ay * dt * dt;
+      positions[idx+2] += vz * metalDamping + az * dt * dt;
+    }
+
+    // 2. Neighbor / Topology Laplacian constraint relaxation
+    // Runs 2 passes for structural cohesion and clean crater contouring
+    for (let iter = 0; iter < 2; iter++) {
+      for (let i = 0; i < count; i++) {
+        const idx = i * 3;
+        const neighborsList = vs.neighbors[i];
+        if (neighborsList.size === 0) continue;
+
+        let sumX = 0, sumY = 0, sumZ = 0;
+        neighborsList.forEach(n => {
+          sumX += positions[n*3];
+          sumY += positions[n*3+1];
+          sumZ += positions[n*3+2];
+        });
+
+        const avgX = sumX / neighborsList.size;
+        const avgY = sumY / neighborsList.size;
+        const avgZ = sumZ / neighborsList.size;
+
+        const tension = 0.22; // Membrane surface tension strength
+        positions[idx] += (avgX - positions[idx]) * tension;
+        positions[idx+1] += (avgY - positions[idx+1]) * tension;
+        positions[idx+2] += (avgZ - positions[idx+2]) * tension;
+      }
+    }
+
+    // Notify ThreeJS that geometry positions have been dynamically deformed
+    posAttr.needsUpdate = true;
+    activeGeom.computeVertexNormals(); // Refresh vertex normals for superb dynamic light reflections!
+  });
+
+  useEffect(() => {
+    if (!activeGeom) return;
+
+    const handleImpact = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      const { detail } = customEvent;
+      if (!detail || detail.type !== 'collision') return;
+      
+      // Only react if this component belongs to the damaged bot
+      if (detail.defenderId !== ownerId) return;
+
+      const mesh = meshRef.current;
+      if (!mesh) return;
+
+      const vs = verletStateRef.current;
+      if (!vs) return;
+
+      // Transform world contact point to this local mesh's coordinate frame
+      const worldPos = new THREE.Vector3(detail.position[0], detail.position[1], detail.position[2]);
+      const localPos = worldPos.clone();
+      mesh.worldToLocal(localPos);
+
+      // Transform world normal to local space for precision indent projection
+      let localNormal = new THREE.Vector3(0, -1, 0);
+      if (detail.normal) {
+        const worldNormal = new THREE.Vector3(detail.normal[0], detail.normal[1], detail.normal[2]);
+        localNormal = worldNormal.clone().transformDirection(mesh.matrixWorld).normalize();
+      }
+
+      const posAttr = activeGeom.attributes.position;
+      const colorAttr = activeGeom.attributes.color;
+      if (!posAttr || !colorAttr) return;
+
+      const positions = posAttr.array as Float32Array;
+      const colors = colorAttr.array as Float32Array;
+      const count = posAttr.count;
+
+      const damageAmount = detail.damageAmount || 1.0;
+      
+      // Sophisticated dynamic radius and indentation depth based on real impact energy / damage vectors!
+      const radius = 0.45 + Math.min(damageAmount * 0.42, 1.25); 
+      const maxDent = 0.16 + Math.min(damageAmount * 0.18, 0.45);
+
+      let deformedAny = false;
+
+      for (let i = 0; i < count; i++) {
+        const idx = i * 3;
+        const vx = positions[idx];
+        const vy = positions[idx+1];
+        const vz = positions[idx+2];
+
+        // Euclidean distance in local space
+        const dx = vx - localPos.x;
+        const dy = vy - localPos.y;
+        const dz = vz - localPos.z;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (dist < radius) {
+          // Dynamic Gaussian Radial Basis Falloff for elastic/plastic deformation contouring
+          const sigma = radius * 0.45;
+          const falloff = Math.exp(-(dist * dist) / (2 * sigma * sigma));
+
+          // Combine collision vector thrust, local normal punch, and outward radial rim bulge!
+          const toVertex = new THREE.Vector3(vx, vy, vz).sub(localPos).normalize();
+          
+          // The main displacement direction: punch inward relative to the local normal, 
+          // but expand slightly radially around the edges to form a perfect crater rim!
+          const displaceDir = new THREE.Vector3()
+            .addScaledVector(localNormal, -0.85) // strong inward hit along normal
+            .addScaledVector(toVertex, 0.18)     // radial outward flow (metal displacement)
+            .normalize();
+
+          // Physical vertex velocity shock (direct position modification + Verlet momentum transfer)
+          const displacement = maxDent * falloff;
+          
+          positions[idx] += displaceDir.x * displacement;
+          positions[idx+1] += displaceDir.y * displacement;
+          positions[idx+2] += displaceDir.z * displacement;
+
+          // Charcoal scorch painting: lerping towards dark charred carbon/ash
+          const scorchR = 0.08;
+          const scorchG = 0.06;
+          const scorchB = 0.05;
+
+          colors[idx] = THREE.MathUtils.lerp(colors[idx], scorchR, falloff * 0.95);
+          colors[idx+1] = THREE.MathUtils.lerp(colors[idx+1], scorchG, falloff * 0.95);
+          colors[idx+2] = THREE.MathUtils.lerp(colors[idx+2], scorchB, falloff * 0.95);
+
+          deformedAny = true;
+        }
+      }
+
+      if (deformedAny) {
+        // Wake up Verlet physical simulation to propagate shockwaves & relax neighbor constraints
+        vs.active = true;
+        vs.settleTimer = 1.8; // Run simulation for 1.8 seconds after impact to let ripples settle
+
+        posAttr.needsUpdate = true;
+        colorAttr.needsUpdate = true;
+        activeGeom.computeVertexNormals(); // Initial normal update for immediate feedback
+      }
+    };
+
+    window.addEventListener('combat-impact', handleImpact);
+    return () => {
+      window.removeEventListener('combat-impact', handleImpact);
+    };
+  }, [activeGeom, ownerId]);
+
+  if (!activeGeom) return null;
 
   return (
-    <mesh castShadow receiveShadow geometry={geom}>
-      <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
+    <mesh ref={meshRef} castShadow receiveShadow geometry={activeGeom}>
+      <meshStandardMaterial
+        color={color}
+        vertexColors={true} // Enable multi-channel vertex colors
+        metalness={metalness}
+        roughness={roughness}
+        emissive={emissive}
+        emissiveIntensity={emissiveIntensity}
+      />
+      {children}
     </mesh>
   );
 };
+
+const WedgeMesh = ({ size, color, emissive, emissiveIntensity }: { size: [number, number, number]; color: string; emissive?: string; emissiveIntensity?: number }) => {
+  const [w, h, d] = size;
+  const damageFactor = useContext(DamageContext);
+
+  const damagedColor = useMemo(() => {
+    if (!damageFactor) return color;
+    const base = new THREE.Color(color);
+    const scorch = new THREE.Color('#2b1d14');
+    return base.lerp(scorch, damageFactor * 0.75).getStyle();
+  }, [color, damageFactor]);
+
+  const geom = useMemo(() => {
+    try {
+      const shape = new THREE.Shape();
+      const bevel = 0.015;
+      shape.moveTo(-d/2 + bevel, -h/2 + bevel);
+      shape.lineTo(d/2 - bevel, -h/2 + bevel);
+      shape.lineTo(d/2 - bevel, h/2 - bevel);
+      shape.closePath();
+
+      const extrudeSettings = {
+        depth: Math.max(0.01, w - bevel * 2),
+        bevelEnabled: true,
+        bevelSegments: 3,
+        steps: 1,
+        bevelSize: bevel,
+        bevelThickness: bevel
+      };
+      const geo = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+      geo.center();
+      geo.rotateY(Math.PI / 2);
+      return geo;
+    } catch (err) {
+      console.error(err);
+      // Fallback
+      const shape = new THREE.Shape();
+      shape.moveTo(-d/2, -h/2);
+      shape.lineTo(d/2, -h/2);
+      shape.lineTo(-d/2, h/2);
+      shape.closePath();
+      const g = new THREE.ExtrudeGeometry(shape, { depth: w, bevelEnabled: false });
+      g.center();
+      g.rotateY(Math.PI / 2);
+      return g;
+    }
+  }, [w, h, d]);
+
+  return (
+    <DeformableMesh
+      geometry={geom}
+      color={damagedColor}
+      metalness={0.8 - (damageFactor * 0.5)}
+      roughness={0.2 + (damageFactor * 0.6)}
+      emissive={emissive || '#000000'}
+      emissiveIntensity={emissiveIntensity || 0}
+    />
+  );
+};
+
+const RoundedBoxMesh = ({ size, color, emissive, emissiveIntensity }: { size: [number, number, number]; color: string; emissive?: string; emissiveIntensity?: number }) => {
+  const [w, h, d] = size;
+  const damageFactor = useContext(DamageContext);
+
+  const damagedColor = useMemo(() => {
+    if (!damageFactor) return color;
+    const base = new THREE.Color(color);
+    const scorch = new THREE.Color('#2b1d14');
+    return base.lerp(scorch, damageFactor * 0.75).getStyle();
+  }, [color, damageFactor]);
+
+  const geom = useMemo(() => {
+    try {
+      const radius = Math.min(w, h, d, 0.04);
+      const bevel = 0.01;
+      const shape = new THREE.Shape();
+      const width = Math.max(0.01, w - radius * 2);
+      const height = Math.max(0.01, h - radius * 2);
+      const x = -width / 2;
+      const y = -height / 2;
+
+      shape.moveTo(x, y + radius);
+      shape.lineTo(x, y + height);
+      shape.quadraticCurveTo(x, y + height + radius, x + radius, y + height + radius);
+      shape.lineTo(x + width, y + height + radius);
+      shape.quadraticCurveTo(x + width + radius, y + height + radius, x + width + radius, y + height);
+      shape.lineTo(x + width + radius, y + radius);
+      shape.quadraticCurveTo(x + width + radius, y, x + width, y);
+      shape.lineTo(x + radius, y);
+      shape.quadraticCurveTo(x, y, x, y + radius);
+
+      const extrudeSettings = {
+        depth: Math.max(0.01, d - bevel * 2),
+        bevelEnabled: true,
+        bevelSegments: 3,
+        steps: 1,
+        bevelSize: bevel,
+        bevelThickness: bevel,
+        curveSegments: 12
+      };
+
+      const geo = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+      geo.center();
+      return geo;
+    } catch (err) {
+      console.error(err);
+      return new THREE.BoxGeometry(w, h, d);
+    }
+  }, [w, h, d]);
+
+  return (
+    <DeformableMesh
+      geometry={geom}
+      color={damagedColor}
+      metalness={0.8 - (damageFactor * 0.5)}
+      roughness={0.2 + (damageFactor * 0.6)}
+      emissive={emissive || '#000000'}
+      emissiveIntensity={emissiveIntensity || 0}
+    />
+  );
+};
+
 
 const EffectsManager = () => {
   const cleanupEffects = useGameStore(s => s.cleanupEffects);
@@ -232,24 +658,6 @@ const BotDamageVisuals = ({ botId }: { botId: string }) => {
         
         return (
           <group key={comp.componentId} position={offset as [number, number, number]}>
-            {comp.visualState === 'scuffed' && (
-              <mesh position={[0, 0.01, 0]}>
-                <planeGeometry args={[0.4, 0.4]} />
-                <meshBasicMaterial color="#333" transparent opacity={0.4} />
-              </mesh>
-            )}
-            {comp.visualState === 'dented' && (
-              <mesh position={[0, 0.01, 0]}>
-                <circleGeometry args={[0.3, 16]} />
-                <meshStandardMaterial color="#111" roughness={0.9} />
-              </mesh>
-            )}
-            {comp.visualState === 'exposed' && (
-              <mesh position={[0, 0.01, 0]}>
-                <planeGeometry args={[0.6, 0.4]} />
-                <meshStandardMaterial color="#555" roughness={0.5} metalness={0.8} />
-              </mesh>
-            )}
             {comp.detached && (
                // Render nothing if detached, could also spawn debris
                null
@@ -279,12 +687,34 @@ const Bot = ({
   const weaponRef = useRef<THREE.Group>(null);
   const meshRef = useRef<THREE.Group>(null);
   const visualRootRef = useRef<THREE.Group>(null);
+
+  
+
   const pistonCylinderRef = useRef<THREE.Group>(null);
   const pistonRodRef = useRef<THREE.Group>(null);
   const frontRightWheelRef = useRef<THREE.Group>(null);
   const frontLeftWheelRef = useRef<THREE.Group>(null);
   const backRightWheelRef = useRef<THREE.Group>(null);
   const backLeftWheelRef = useRef<THREE.Group>(null);
+  const frontGroupRef = useRef<THREE.Group>(null);
+  const leftGroupRef = useRef<THREE.Group>(null);
+  const rightGroupRef = useRef<THREE.Group>(null);
+  const rearGroupRef = useRef<THREE.Group>(null);
+  const topGroupRef = useRef<THREE.Group>(null);
+  const compOffsetsRef = useRef<Record<string, {
+    jolt: [number, number, number];
+    joltAngular: [number, number, number];
+    wobble: number;
+    wobblePhase: number;
+    wobbleAmplitude: number;
+  }>>({
+    front: { jolt: [0, 0, 0], joltAngular: [0, 0, 0], wobble: 0, wobblePhase: 0, wobbleAmplitude: 0 },
+    left: { jolt: [0, 0, 0], joltAngular: [0, 0, 0], wobble: 0, wobblePhase: 0, wobbleAmplitude: 0 },
+    right: { jolt: [0, 0, 0], joltAngular: [0, 0, 0], wobble: 0, wobblePhase: 0, wobbleAmplitude: 0 },
+    rear: { jolt: [0, 0, 0], joltAngular: [0, 0, 0], wobble: 0, wobblePhase: 0, wobbleAmplitude: 0 },
+    top: { jolt: [0, 0, 0], joltAngular: [0, 0, 0], wobble: 0, wobblePhase: 0, wobbleAmplitude: 0 },
+    core: { jolt: [0, 0, 0], joltAngular: [0, 0, 0], wobble: 0, wobblePhase: 0, wobbleAmplitude: 0 },
+  });
   const customPartsRefs = useRef<Record<string, THREE.Group | null>>({});
   
   const cooldownRef = useRef(0);
@@ -311,14 +741,143 @@ const Bot = ({
   const actualColor = isPlayer ? paintScheme : "#FF003C";
   const actualWeaponType = isPlayer ? config.weapon.type : opponentConfig.weapon.type;
   const currentBotConfig = isPlayer ? config : opponentConfig;
-  const isCustom = isPlayer && currentBotConfig.isCustom && currentBotConfig.parts && currentBotConfig.parts.length > 0;
+  const isCustom = currentBotConfig.isCustom && currentBotConfig.parts && currentBotConfig.parts.length > 0;
   const resolvedParts = useMemo(() => isCustom && currentBotConfig.customConfig ? resolvePartTransformsV2(currentBotConfig.customConfig.parts, currentBotConfig.customConfig.rootPartId) : [], [isCustom, currentBotConfig.customConfig]);
 
-  const getPartFalloffThreshold = (instanceId: string, partType: string) => {
-    const hash = parseInt(instanceId.replace(/[^0-9a-f]/gi, '').slice(-4) || '8000', 16) / 65535;
-    const isVital = partType === 'chassis' || partType === 'wheel' || partType === 'weapon' || partType === 'motor';
-    return isVital ? 0.98 : 0.2 + hash * 0.7;
+  const assemblyPlan = useMemo(() => {
+    if (isCustom && currentBotConfig.customConfig) {
+      return finalizeAssemblyPlan(currentBotConfig.customConfig);
+    }
+    return null;
+  }, [isCustom, currentBotConfig.customConfig]);
+
+  const mechanicalStateRef = useRef<CombatMechanicalState | null>(null);
+
+  useEffect(() => {
+    if (assemblyPlan && isCustom && currentBotConfig.customConfig) {
+      const stateObj = initializeCombatMechanicalState(
+        currentBotConfig.customConfig,
+        assemblyPlan,
+        isPlayer ? 'player' : 'opponent'
+      );
+      mechanicalStateRef.current = stateObj;
+      globalMechanicalState[isPlayer ? 'player' : 'opponent'].current = stateObj;
+    } else {
+      mechanicalStateRef.current = null;
+      globalMechanicalState[isPlayer ? 'player' : 'opponent'].current = null;
+    }
+  }, [assemblyPlan, isCustom, isPlayer]);
+
+  const getHitZoneFromPart = (node: any) => {
+    if (!node) return 'core';
+    const category = node.category || node.type;
+    if (category === 'chassis') return 'core';
+    const pos = node.localPosition || [0,0,0];
+    if (pos[1] > 0.4) return 'top';
+    if (Math.abs(pos[0]) > Math.abs(pos[2])) {
+      return pos[0] > 0 ? 'right' : 'left';
+    } else {
+      return pos[2] < 0 ? 'front' : 'rear';
+    }
   };
+
+  useEffect(() => {
+    const handleGlobalImpact = (ev: Event) => {
+      const customEv = ev as CustomEvent;
+      const detail = customEv.detail;
+      if (!detail || detail.defenderId !== (isPlayer ? 'player' : 'opponent')) return;
+
+      if (mechanicalStateRef.current && assemblyPlan) {
+        const mState = mechanicalStateRef.current;
+        const norm = detail.normal || [0, 1, 0];
+        const impulseAmt = detail.impactEnergy || 10;
+        
+        const packet: ImpactLoadPacket = {
+          eventId: `imp_${Date.now()}_${Math.random()}`,
+          sequence: mState.simulationTick,
+          simulationTick: mState.simulationTick,
+          sourceBotId: detail.attackerId || (isPlayer ? 'opponent' : 'player'),
+          targetBotId: isPlayer ? 'player' : 'opponent',
+          struckPartInstanceId: detail.hitZone || 'core',
+          worldContactPoint: detail.position || [0,0,0],
+          worldContactNormal: norm,
+          linearImpulseWorld: [norm[0] * impulseAmt, norm[1] * impulseAmt, norm[2] * impulseAmt],
+          normalEnergy: impulseAmt,
+          tangentialEnergy: impulseAmt * 0.25,
+          localAbsorbedEnergy: impulseAmt * 0.4,
+          transferableEnergy: impulseAmt * 0.6,
+          obliquityRadians: 0,
+          overmatchRatio: 1.0,
+          fatigueSusceptibility: 1.0
+        };
+
+        const propResult = propagateImpactLoad(mState, packet, assemblyPlan);
+        
+        propResult.damageEvents.forEach(msg => {
+          addLog(msg, "warning");
+        });
+
+        // Sync with store
+        const storeComponents = useGameStore.getState()[isPlayer ? 'playerDamageComponents' : 'opponentDamageComponents'];
+        const hitZoneNode = assemblyPlan.nodes.find(n => n.instanceId === detail.hitZone);
+        const hitZoneKey = getHitZoneFromPart(hitZoneNode);
+        const compObj = storeComponents[hitZoneKey];
+        
+        if (compObj) {
+          const updatedComp = { ...compObj };
+          const mechanicalNode = mState.nodes.find(n => n.partInstanceId === detail.hitZone);
+          if (mechanicalNode) {
+            if (mechanicalNode.failureState === 'failed' || mechanicalNode.failureState === 'detached') {
+              updatedComp.detached = true;
+              updatedComp.visualState = 'detached';
+              updatedComp.mountIntegrity = 0;
+            } else if (mechanicalNode.mountIntegrity < 0.4) {
+              updatedComp.visualState = 'loose';
+              updatedComp.mountIntegrity = mechanicalNode.mountIntegrity;
+            } else if (mechanicalNode.materialIntegrity < 0.5) {
+              updatedComp.visualState = 'exposed';
+            } else if (mechanicalNode.materialIntegrity < 0.8) {
+              updatedComp.visualState = 'dented';
+            }
+            
+            useGameStore.setState((state) => {
+              const currentDict = isPlayer ? state.playerDamageComponents : state.opponentDamageComponents;
+              const nextDict = { ...currentDict, [hitZoneKey]: updatedComp };
+              return isPlayer ? { playerDamageComponents: nextDict } : { opponentDamageComponents: nextDict };
+            });
+          }
+        }
+
+        propResult.detachedParts.forEach(partId => {
+          addLog(`Component ${partId} on ${isPlayer ? 'Player' : 'Opponent'} bot was RIPPED OFF structurally!`, "critical");
+          if (customPartsRefs.current[partId]) {
+            customPartsRefs.current[partId].visible = false;
+          }
+        });
+      }
+    };
+
+    window.addEventListener('combat-impact', handleGlobalImpact);
+    return () => {
+      window.removeEventListener('combat-impact', handleGlobalImpact);
+    };
+  }, [assemblyPlan, isPlayer, isCustom]);
+
+  
+
+  useEffect(() => {
+    if (visualRootRef.current) {
+      visualRootRef.current.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          globalDeformation.registerMesh(isPlayer ? 'player' : 'opponent', child as THREE.Mesh);
+        }
+      });
+    }
+    return () => {
+      globalDeformation.unregisterBot(isPlayer ? 'player' : 'opponent');
+    };
+  }, [isPlayer, resolvedParts]); // re-run if parts change
+
 
   // Elite Upgrades helper state and refs
   const overchargeHeatRef = useRef(0);
@@ -328,31 +887,55 @@ const Bot = ({
   const detachedParts = useRef<Set<string>>(new Set());
   const addLog = useGameStore(s => s.addLog);
 
-  useEffect(() => {
+  useFrame(() => {
     if (battleStatus === 'countdown' || battleStatus === 'menu') {
       detachedParts.current.clear();
+      return;
     }
-  }, [battleStatus]);
 
-  useEffect(() => {
-    if (botHealth <= 0) return;
-    
-    // Check Custom Bot Parts
-    if (isCustom && currentBotConfig.customConfig && currentBotConfig.customConfig.parts) {
-      resolvedParts.forEach(tr => {
-        const partDef = PART_TEMPLATES.find(p => p.templateId === tr.definitionId) as any;
-        if (!partDef) return;
-        const threshold = getPartFalloffThreshold(tr.instanceId, partDef.type || partDef.category || '');
-        if (damageFactor > threshold && !detachedParts.current.has(tr.instanceId)) {
-          detachedParts.current.add(tr.instanceId);
-          if (bodyRef?.current) {
-             const pos = bodyRef.current.translation();
-             useGameStore.getState().spawnSparks([pos.x, pos.y + 0.5, pos.z], 12, '#FFFFFF');
-             useGameStore.getState().spawnDebris([pos.x, pos.y + 0.5, pos.z], 5);
+    if (isCustom && currentBotConfig.customConfig && currentBotConfig.customConfig.parts && mechanicalStateRef.current) {
+      mechanicalStateRef.current.nodes.forEach(node => {
+        if ((node.failureState === 'detached' || node.failureState === 'failed') && !detachedParts.current.has(node.partInstanceId)) {
+          detachedParts.current.add(node.partInstanceId);
+          
+          const meshGroup = customPartsRefs.current[node.partInstanceId];
+          if (meshGroup) {
+            const worldPos = new THREE.Vector3();
+            const worldQuat = new THREE.Quaternion();
+            meshGroup.getWorldPosition(worldPos);
+            meshGroup.getWorldQuaternion(worldQuat);
+            
+            const part = currentBotConfig.customConfig!.parts.find(p => p.instanceId === node.partInstanceId);
+            const partDef = PART_TEMPLATES.find(p => p.templateId === part?.definitionId);
+            
+            if (part && partDef) {
+               const linvel = bodyRef.current ? bodyRef.current.linvel() : { x:0, y:0, z:0 };
+               const angvel = bodyRef.current ? bodyRef.current.angvel() : { x:0, y:0, z:0 };
+
+               useGameStore.getState().spawnFragment({
+                 id: `${isPlayer ? 'player' : 'opponent'}_frag_${node.partInstanceId}_${Date.now()}`,
+                 partId: node.partInstanceId,
+                 definitionId: partDef.templateId,
+                 position: [worldPos.x, worldPos.y, worldPos.z],
+                 rotation: [worldQuat.x, worldQuat.y, worldQuat.z, worldQuat.w],
+                 velocity: [linvel.x + (Math.random()-0.5)*2, linvel.y + 2 + Math.random(), linvel.z + (Math.random()-0.5)*2],
+                 angularVelocity: [angvel.x + (Math.random()-0.5)*5, angvel.y + (Math.random()-0.5)*5, angvel.z + (Math.random()-0.5)*5],
+                 color: part.color || '#ffffff',
+                 botId: isPlayer ? 'player' : 'opponent',
+                 timestamp: Date.now()
+               });
+               
+               useGameStore.getState().spawnSparks([worldPos.x, worldPos.y, worldPos.z], 15, '#FFFFFF');
+               useGameStore.getState().spawnDebris([worldPos.x, worldPos.y, worldPos.z], 8);
+            }
           }
         }
       });
     }
+  });
+
+  useEffect(() => {
+    if (botHealth <= 0) return;
 
     // Predefined Bot Parts
     if (actualWeaponType === 'drum') {
@@ -384,8 +967,28 @@ const Bot = ({
     }
   }, [botHealth, damageFactor, actualWeaponType, isPlayer, addLog, bodyRef, isCustom, currentBotConfig, resolvedParts]);
 
+  useEffect(() => {
+    if (!damageComponents) return;
+    Object.entries(damageComponents).forEach(([zone, comp]) => {
+      const offset = compOffsetsRef.current[zone];
+      if (offset && comp && comp.lastHitTime > 0) {
+        offset.jolt = [
+          comp.visualOffset.jolt[0] * 1.5,
+          comp.visualOffset.jolt[1] * 1.5,
+          comp.visualOffset.jolt[2] * 1.5
+        ];
+        const impulseNorm = Math.sqrt(
+          comp.visualOffset.jolt[0] * comp.visualOffset.jolt[0] +
+          comp.visualOffset.jolt[1] * comp.visualOffset.jolt[1] +
+          comp.visualOffset.jolt[2] * comp.visualOffset.jolt[2]
+        );
+        offset.wobbleAmplitude = Math.min(0.5, offset.wobbleAmplitude + impulseNorm * 10 + 0.2);
+      }
+    });
+  }, [damageComponents]);
+
   useFrame((state, delta) => {
-    const finalDelta = delta;
+    const finalDelta = Math.min(delta, 0.05);
 
     if (cooldownRef.current > 0) cooldownRef.current -= finalDelta;
     if (fireAnimRef.current > 0) fireAnimRef.current -= finalDelta * 5; // Animate over 0.2 seconds
@@ -527,7 +1130,8 @@ const Bot = ({
          if (Math.abs(speedForward) > 3.0 && Math.random() < 0.25) {
              useGameStore.getState().spawnSparks([posRaw.x, 0.05, posRaw.z], 3, '#FFAA00');
              // Drag friction
-             bodyRef.current.applyImpulse({ x: -linvel.x * 0.15 * delta, y: 0, z: -linvel.z * 0.15 * delta }, true);
+             const dragScale = currentBotConfig.armor.weight / 10;
+             bodyRef.current.applyImpulse({ x: -linvel.x * 0.15 * delta * dragScale, y: 0, z: -linvel.z * 0.15 * delta * dragScale }, true);
          }
       }
       
@@ -537,7 +1141,8 @@ const Bot = ({
          const driftAmount = (Math.abs(speedForward) - 15.0) * 0.05 * delta;
          const rightDir = new THREE.Vector3(1, 0, 0).applyEuler(euler);
          // Push the bot "out" of the turn
-         bodyRef.current.applyImpulse({ x: rightDir.x * Math.sign(turnRate) * driftAmount * 15.0, y: 0, z: rightDir.z * Math.sign(turnRate) * driftAmount * 15.0 }, true);
+         const driftScale = currentBotConfig.armor.weight / 10;
+         bodyRef.current.applyImpulse({ x: rightDir.x * Math.sign(turnRate) * driftAmount * 15.0 * driftScale, y: 0, z: rightDir.z * Math.sign(turnRate) * driftAmount * 15.0 * driftScale }, true);
          if (Math.random() < 0.15) {
              useGameStore.getState().spawnSparks([posRaw.x, 0.05, posRaw.z], 1, '#888888'); // tire smoke/dust
          }
@@ -545,7 +1150,7 @@ const Bot = ({
 
       globalPhysicsState[isPlayer ? 'player' : 'opponent'].pos.set(posRaw.x, posRaw.y, posRaw.z);
       globalPhysicsState[isPlayer ? 'player' : 'opponent'].vel.set(linvel.x, linvel.y, linvel.z);
-      globalPhysicsState[isPlayer ? 'player' : 'opponent'].mass = (currentBotConfig.armor.weight / 10) * settings.chassisMassScale;
+      globalPhysicsState[isPlayer ? 'player' : 'opponent'].mass = currentBotConfig.armor.weight * settings.chassisMassScale;
       
       // Animation State Update
       const myState = globalPhysicsState[isPlayer ? 'player' : 'opponent'];
@@ -640,53 +1245,186 @@ const Bot = ({
          bodyRef.current.setLinvel(linvel, true);
       }
 
+      // 1. Decay and update component-level damage offsets
+      Object.keys(compOffsetsRef.current).forEach((zone) => {
+        const offset = compOffsetsRef.current[zone];
+        
+        // Decay raw recoil jolt
+        offset.jolt[0] = THREE.MathUtils.lerp(offset.jolt[0], 0, finalDelta * 10);
+        offset.jolt[1] = THREE.MathUtils.lerp(offset.jolt[1], 0, finalDelta * 10);
+        offset.jolt[2] = THREE.MathUtils.lerp(offset.jolt[2], 0, finalDelta * 10);
+
+        // Persistent rattled vibration if component is loose/damaged
+        const comp = damageComponents?.[zone];
+        let freq = 12;
+        if (comp?.visualState === 'loose') {
+          freq = 28; // High speed vibration
+          // Driving speeds and active spinner/drum weapons feed structural vibration/entropy
+          const driveVib = (Math.abs(speedForward) * 0.08) + (isSpinning ? 0.12 : 0);
+          offset.wobbleAmplitude = THREE.MathUtils.lerp(offset.wobbleAmplitude, driveVib + 0.05, finalDelta * 4);
+        } else if (comp?.visualState === 'exposed' || comp?.visualState === 'dented') {
+          freq = 18;
+          const driveVib = (Math.abs(speedForward) * 0.03) + (isSpinning ? 0.05 : 0);
+          offset.wobbleAmplitude = THREE.MathUtils.lerp(offset.wobbleAmplitude, driveVib, finalDelta * 3);
+        } else {
+          offset.wobbleAmplitude = THREE.MathUtils.lerp(offset.wobbleAmplitude, 0, finalDelta * 6);
+        }
+
+        offset.wobblePhase += finalDelta * freq;
+        offset.wobble = Math.sin(offset.wobblePhase) * offset.wobbleAmplitude;
+      });
+
+      // 2. Apply displacement, rattle, and hanging sag to predefined armor components
+      if (frontGroupRef.current) {
+        const offsets = compOffsetsRef.current.front;
+        const comp = damageComponents?.front;
+        frontGroupRef.current.position.set(offsets.jolt[0], offsets.jolt[1] + offsets.wobble * 0.08, offsets.jolt[2]);
+        const sag = comp?.visualState === 'exposed' ? 0.08 : 0;
+        frontGroupRef.current.rotation.set(offsets.wobble * 0.06 + sag, offsets.wobble * 0.03, 0);
+      }
+      if (leftGroupRef.current) {
+        const offsets = compOffsetsRef.current.left;
+        const comp = damageComponents?.left;
+        leftGroupRef.current.position.set(offsets.jolt[0] + offsets.wobble * 0.04, offsets.jolt[1], offsets.jolt[2]);
+        const sag = comp?.visualState === 'exposed' ? -0.12 : 0; // outward lean
+        leftGroupRef.current.rotation.set(0, offsets.wobble * 0.03, offsets.wobble * 0.06 + sag);
+      }
+      if (rightGroupRef.current) {
+        const offsets = compOffsetsRef.current.right;
+        const comp = damageComponents?.right;
+        rightGroupRef.current.position.set(offsets.jolt[0] + offsets.wobble * 0.04, offsets.jolt[1], offsets.jolt[2]);
+        const sag = comp?.visualState === 'exposed' ? 0.12 : 0; // outward lean
+        rightGroupRef.current.rotation.set(0, offsets.wobble * 0.03, offsets.wobble * 0.06 + sag);
+      }
+      if (rearGroupRef.current) {
+        const offsets = compOffsetsRef.current.rear;
+        const comp = damageComponents?.rear;
+        rearGroupRef.current.position.set(offsets.jolt[0], offsets.jolt[1] + offsets.wobble * 0.06, offsets.jolt[2]);
+        const sag = comp?.visualState === 'exposed' ? 0.08 : 0;
+        rearGroupRef.current.rotation.set(offsets.wobble * 0.06 + sag, offsets.wobble * 0.03, 0);
+      }
+      if (topGroupRef.current) {
+        const offsets = compOffsetsRef.current.top;
+        const comp = damageComponents?.top;
+        topGroupRef.current.position.set(offsets.jolt[0], offsets.jolt[1] + offsets.wobble * 0.06, offsets.jolt[2]);
+        const sag = comp?.visualState === 'exposed' ? 0.06 : 0;
+        topGroupRef.current.rotation.set(offsets.wobble * 0.04, offsets.wobble * 0.05, offsets.wobble * 0.04 + sag);
+      }
+
+      // 3. Compute structural wheel wobble (axle precession) based on damage
+      const leftWobble = damageComponents?.left?.visualState === 'loose'
+        ? Math.sin(state.clock.getElapsedTime() * 32) * 0.16
+        : (damageComponents?.left?.visualState === 'exposed' || damageComponents?.left?.visualState === 'dented' ? Math.sin(state.clock.getElapsedTime() * 16) * 0.05 : 0);
+
+      const rightWobble = damageComponents?.right?.visualState === 'loose'
+        ? Math.sin(state.clock.getElapsedTime() * 32) * 0.16
+        : (damageComponents?.right?.visualState === 'exposed' || damageComponents?.right?.visualState === 'dented' ? Math.sin(state.clock.getElapsedTime() * 16) * 0.05 : 0);
+
       const leftSpin = (speedForward - turnRate * 0.9) / 0.42;
       const rightSpin = (speedForward + turnRate * 0.9) / 0.42;
 
-      if (frontRightWheelRef.current) frontRightWheelRef.current.rotation.x -= rightSpin * finalDelta;
-      if (backRightWheelRef.current) backRightWheelRef.current.rotation.x -= rightSpin * finalDelta;
-      if (frontLeftWheelRef.current) frontLeftWheelRef.current.rotation.x -= leftSpin * finalDelta;
-      if (backLeftWheelRef.current) backLeftWheelRef.current.rotation.x -= leftSpin * finalDelta;
+      if (frontRightWheelRef.current) {
+        frontRightWheelRef.current.rotation.x -= rightSpin * finalDelta;
+        frontRightWheelRef.current.rotation.y = rightWobble;
+        frontRightWheelRef.current.rotation.z = rightWobble * 0.5;
+      }
+      if (backRightWheelRef.current) {
+        backRightWheelRef.current.rotation.x -= rightSpin * finalDelta;
+        backRightWheelRef.current.rotation.y = rightWobble;
+        backRightWheelRef.current.rotation.z = rightWobble * 0.5;
+      }
+      if (frontLeftWheelRef.current) {
+        frontLeftWheelRef.current.rotation.x -= leftSpin * finalDelta;
+        frontLeftWheelRef.current.rotation.y = leftWobble;
+        frontLeftWheelRef.current.rotation.z = leftWobble * 0.5;
+      }
+      if (backLeftWheelRef.current) {
+        backLeftWheelRef.current.rotation.x -= leftSpin * finalDelta;
+        backLeftWheelRef.current.rotation.y = leftWobble;
+        backLeftWheelRef.current.rotation.z = leftWobble * 0.5;
+      }
 
       if (isCustom && currentBotConfig.parts) {
         currentBotConfig.parts.forEach(part => {
           const meshGroup = customPartsRefs.current[(part as any).id || (part as any).instanceId];
-          if (meshGroup) {
+          if (meshGroup && meshGroup.children.length > 0) {
+            const visualWrapper = meshGroup.children[0] as THREE.Group;
+            const partId = (part as any).instanceId || (part as any).id;
             const partDef = PART_TEMPLATES.find(p => p.templateId === (part as any).definitionId || p.templateId === (part as any).templateId);
             const pType = partDef ? (partDef.type || (partDef as any).category) : null;
+            
+            // Procedural deformation based on mount integrity
+            const nodeIdx = mechanicalStateRef.current?.nodeIndexByInstanceId.get(partId);
+            if (nodeIdx !== undefined && mechanicalStateRef.current) {
+               const mNode = mechanicalStateRef.current.nodes[nodeIdx];
+               const integrity = mNode.mountIntegrity;
+               if (integrity < 1.0) {
+                 const damageSeverity = 1.0 - integrity;
+                 const shake = damageSeverity > 0.5 ? Math.sin(state.clock.getElapsedTime() * 50) * 0.05 * damageSeverity : 0;
+                 // Permanent sag/bend from damage
+                 visualWrapper.position.y = -damageSeverity * 0.1 + shake;
+                 visualWrapper.rotation.z = damageSeverity * 0.2 + shake;
+                 visualWrapper.rotation.x = shake;
+               }
+            }
+
             if (pType === 'wheel') {
-              const isLeft = ((part as any).position?.[0] || (part as any).localPosition?.[0]) < 0;
-              const spin = isLeft ? leftSpin : rightSpin;
-              // Rotate the entire part group around its local X axis (which points left/right in world space)
-              meshGroup.rotation.x -= spin * finalDelta;
+              const wheelState = mechanicalStateRef.current?.wheels.find(w => w.partInstanceId === partId);
+              if (wheelState) {
+                const edgeIdx = nodeIdx !== undefined ? mechanicalStateRef.current?.nodes[nodeIdx].parentEdgeIndex : -1;
+                const edge = (edgeIdx !== undefined && edgeIdx !== -1) ? mechanicalStateRef.current?.edges[edgeIdx] : null;
+                const alignmentVibration = (edge && edge.state !== 'elastic') ? Math.sin(state.clock.getElapsedTime() * 32) * 0.12 : 0;
+                
+                visualWrapper.rotation.x = wheelState.angle;
+                visualWrapper.rotation.y = alignmentVibration;
+                visualWrapper.rotation.z = alignmentVibration * 0.5;
+              } else {
+                const isLeft = ((part as any).position?.[0] || (part as any).localPosition?.[0]) < 0;
+                const spin = isLeft ? leftSpin : rightSpin;
+                const wobble = isLeft ? leftWobble : rightWobble;
+                visualWrapper.rotation.x -= spin * finalDelta;
+                visualWrapper.rotation.y = wobble;
+                visualWrapper.rotation.z = wobble * 0.5;
+              }
             } else if (pType === 'weapon') {
-              const wType = currentBotConfig.weapon.type;
-              if (partDef?.templateId === 'weapon_drum') {
-                const drumSpinner = meshGroup.getObjectByName('DrumSpinner');
-                if (drumSpinner) {
-                  drumSpinner.rotation.x -= currentRPM.current * finalDelta * 15;
-                }
-              } else if (wType === 'spinner' || wType === 'saw' || wType === 'drum') {
-                meshGroup.rotation.y -= currentRPM.current * finalDelta * 0.05;
-              } else if (wType === 'flipper') {
-                meshGroup.rotation.x = flipperPos.current * 0.9;
-              } else if (wType === 'hammer') {
-                if (fireAnimRef.current > 0) {
-                  const t = 1.0 - fireAnimRef.current;
-                  let angle = 0;
-                  if (t < 0.15) angle = -0.35 * Math.sin((t / 0.15) * Math.PI / 2);
-                  else if (t < 0.45) angle = -0.35 + 2.1 * Math.sin(((t - 0.15) / 0.3) * Math.PI / 2);
-                  else angle = 1.75 * Math.pow(1 - (t - 0.45) / 0.55, 2);
-                  meshGroup.rotation.x = angle;
+              const weaponState = mechanicalStateRef.current?.weapons.find(w => w.partInstanceId === partId);
+              if (weaponState) {
+                const wType = currentBotConfig.weapon.type;
+                if (wType === 'spinner' || wType === 'saw' || wType === 'drum') {
+                  if (partDef?.templateId === 'weapon_drum' || partDef?.templateId === 'weapon_spinner') {
+                    visualWrapper.rotation.x = weaponState.angle;
+                  } else {
+                    visualWrapper.rotation.y = weaponState.angle;
+                  }
                 } else {
-                  meshGroup.rotation.x = 0;
+                  visualWrapper.rotation.x = weaponState.angle;
                 }
-              } else if (wType === 'crusher') {
-                if (fireAnimRef.current > 0) {
-                  const t = 1.0 - fireAnimRef.current;
-                  meshGroup.rotation.x = Math.sin(t * Math.PI) * 0.55;
-                } else {
-                  meshGroup.rotation.x = 0;
+              } else {
+                const wType = currentBotConfig.weapon.type;
+                if (partDef?.templateId === 'weapon_drum' || partDef?.templateId === 'weapon_spinner') {
+                  visualWrapper.rotation.x -= currentRPM.current * finalDelta * 0.05;
+                } else if (wType === 'spinner' || wType === 'saw' || wType === 'drum') {
+                  visualWrapper.rotation.y -= currentRPM.current * finalDelta * 0.05;
+                } else if (wType === 'flipper') {
+                  visualWrapper.rotation.x = flipperPos.current * 0.9;
+                } else if (wType === 'hammer') {
+                  if (fireAnimRef.current > 0) {
+                    const t = 1.0 - fireAnimRef.current;
+                    let angle = 0;
+                    if (t < 0.15) angle = -0.35 * Math.sin((t / 0.15) * Math.PI / 2);
+                    else if (t < 0.45) angle = -0.35 + 2.1 * Math.sin(((t - 0.15) / 0.3) * Math.PI / 2);
+                    else angle = 1.75 * Math.pow(1 - (t - 0.45) / 0.55, 2);
+                    visualWrapper.rotation.x = angle;
+                  } else {
+                    visualWrapper.rotation.x = 0;
+                  }
+                } else if (wType === 'crusher') {
+                  if (fireAnimRef.current > 0) {
+                    const t = 1.0 - fireAnimRef.current;
+                    visualWrapper.rotation.x = Math.sin(t * Math.PI) * 0.55;
+                  } else {
+                    visualWrapper.rotation.x = 0;
+                  }
                 }
               }
             }
@@ -734,8 +1472,9 @@ const Bot = ({
           useGameStore.getState().addLog(`Boundary hazard recovery activated for ${isPlayer ? 'Player' : 'Opponent'}.`, 'info');
         } else {
           const centerDir = new THREE.Vector3(0 - currentPos.x, 0, 0 - currentPos.z).normalize();
-          bodyRef.current.applyImpulse({ x: centerDir.x * 10, y: 3, z: centerDir.z * 10 }, true);
-          bodyRef.current.applyTorqueImpulse({ x: 1, y: 3, z: 1 }, true);
+          const massScale = currentBotConfig.armor.weight / 10;
+          bodyRef.current.applyImpulse({ x: centerDir.x * 10 * massScale, y: 3 * massScale, z: centerDir.z * 10 * massScale }, true);
+          bodyRef.current.applyTorqueImpulse({ x: 1 * massScale, y: 3 * massScale, z: 1 * massScale }, true);
           useGameStore.getState().addLog(`Stuck lock resolved for ${isPlayer ? 'Player' : 'Opponent'}.`, 'info');
         }
       }
@@ -747,120 +1486,294 @@ const Bot = ({
         bodyRef.current.wakeUp();
       }
 
-      if (isPlayer) {
-        const keyboardInput = get();
-        const virtualInput = useGameStore.getState().virtualInput;
-        const forward = keyboardInput.forward || virtualInput.forward;
-        const backward = keyboardInput.backward || virtualInput.backward;
-        const left = keyboardInput.left || virtualInput.left;
-        const right = keyboardInput.right || virtualInput.right;
+      let isMechanicalActive = false;
 
-        // Auto-righting if flipped
-        if (up.y < 0.8) {
-          const rightingAxis = new THREE.Vector3().crossVectors(up, new THREE.Vector3(0, 1, 0)).normalize();
-          const rightingStrength = (1.0 - up.y) * 8.0 * (config.armor.weight / 100) * delta * 120;
-          bodyRef.current.applyTorqueImpulse({ x: rightingAxis.x * rightingStrength, y: 0, z: rightingAxis.z * rightingStrength }, true);
-          if (up.y < 0.0 && myPos.y < 1.0) {
-             bodyRef.current.applyImpulse({ x: 0, y: 15.0 * (config.armor.weight / 100) * delta, z: 0 }, true);
+      if (isCustom && mechanicalStateRef.current && assemblyPlan) {
+        const mState = mechanicalStateRef.current;
+        mState.simulationTick++;
+        isMechanicalActive = true;
+
+        if (isPlayer) {
+          const keyboardInput = get();
+          const virtualInput = useGameStore.getState().virtualInput;
+          const forward = keyboardInput.forward || virtualInput.forward;
+          const backward = keyboardInput.backward || virtualInput.backward;
+          const left = keyboardInput.left || virtualInput.left;
+          const right = keyboardInput.right || virtualInput.right;
+
+          const analogY_val = virtualInput.analogY || 0;
+          const analogX_val = virtualInput.analogX || 0;
+          const analogY = analogY_val !== 0 ? analogY_val : (forward ? -1 : backward ? 1 : 0);
+          const analogX = analogX_val !== 0 ? analogX_val : (left ? -1 : right ? 1 : 0);
+
+          const intent: BotControlIntent = {
+            throttle: -analogY,
+            steering: -analogX,
+            brake: (analogY === 0 && analogX === 0) ? 0.8 : 0.0,
+            weaponCommand: isSpinning ? 1.0 : 0.0,
+            selfRightCommand: (up.y < 0.8) ? 1.0 : 0.0
+          };
+
+          const bPos = bodyRef.current.translation();
+          const bRot = bodyRef.current.rotation();
+          resolveGroundSupports(mState, [bPos.x, bPos.y, bPos.z], [bRot.x, bRot.y, bRot.z, bRot.w], assemblyPlan);
+
+          const bLinvel = bodyRef.current.linvel();
+          const bAngvel = bodyRef.current.angvel();
+          const { forces, reactionTorque } = updateWheelGroundDynamics(
+            mState,
+            intent,
+            [bLinvel.x, bLinvel.y, bLinvel.z],
+            [bAngvel.x, bAngvel.y, bAngvel.z],
+            [bRot.x, bRot.y, bRot.z, bRot.w],
+            [bPos.x, bPos.y, bPos.z],
+            assemblyPlan,
+            finalDelta
+          );
+
+          forces.forEach(f => {
+            bodyRef.current.applyImpulseAtPoint(
+              { x: f.force[0] * finalDelta, y: f.force[1] * finalDelta, z: f.force[2] * finalDelta },
+              { x: f.point[0], y: f.point[1], z: f.point[2] },
+              true
+            );
+          });
+
+          bodyRef.current.applyTorqueImpulse(
+            { x: reactionTorque[0] * finalDelta, y: reactionTorque[1] * finalDelta, z: reactionTorque[2] * finalDelta },
+            true
+          );
+
+          const weaponResult = updateWeaponDynamicsAndMomentum(
+            mState,
+            intent,
+            [bAngvel.x, bAngvel.y, bAngvel.z],
+            [bRot.x, bRot.y, bRot.z, bRot.w],
+            assemblyPlan,
+            finalDelta
+          );
+
+          bodyRef.current.applyTorqueImpulse(
+            { x: weaponResult.reactionTorque[0] * finalDelta, y: weaponResult.reactionTorque[1] * finalDelta, z: weaponResult.reactionTorque[2] * finalDelta },
+            true
+          );
+
+          const knockoutEval = evaluateMobilityAndKnockout(mState);
+          if (knockoutEval.isKilled && battleStatus === 'battle') {
+            damageBot('player', 100);
           }
-        }
 
-        const speed = config.motor.maxSpeed * 0.45 * 1.0;
-        const torque = config.motor.torque * 0.025 * 1.0;
-        
-        const analogY_val = virtualInput.analogY || 0;
-        const analogX_val = virtualInput.analogX || 0;
-        const analogY = analogY_val !== 0 ? analogY_val : (forward ? -1 : backward ? 1 : 0);
-        const analogX = analogX_val !== 0 ? analogX_val : (left ? -1 : right ? 1 : 0);
+          globalMechanicalState.player.current = mState;
 
-        if (analogY !== 0) {
-            bodyRef.current.applyImpulse({ x: -dir.x * analogY * speed * delta * 15, y: 0, z: -dir.z * analogY * speed * delta * 15 }, true);
-        } else {
-            // Apply forward/backward linear braking to make controls super sharp and responsive
-            const currentLinVel = bodyRef.current.linvel();
-            const forwardVel = dir.dot(new THREE.Vector3(currentLinVel.x, currentLinVel.y, currentLinVel.z));
-            if (Math.abs(forwardVel) > 0.05) {
-               const brakeForce = dir.clone().multiplyScalar(-forwardVel * 0.12);
-               bodyRef.current.setLinvel({
-                 x: currentLinVel.x + brakeForce.x,
-                 y: currentLinVel.y,
-                 z: currentLinVel.z + brakeForce.z
-               }, true);
+          wantToFire = (keyboardInput.jump || virtualInput.action) && (actualWeaponType === 'flipper' || actualWeaponType === 'hammer' || actualWeaponType === 'crusher');
+        } else if (targetRef?.current) {
+          const targetPos = targetRef.current.translation();
+          const dx = targetPos.x - myPos.x;
+          const dz = targetPos.z - myPos.z;
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          const dot = dir.x * (dx/dist) + dir.z * (dz/dist);
+
+          let throttle = 0;
+          let steering = 0;
+          let brake = 0.0;
+
+          if (dist > 0.4) {
+            if (dot > 0.4) {
+              throttle = dot;
             }
-        }
-        
-        // High quality directional controls with active rotational dampening
-        const currentAngVel = bodyRef.current.angvel();
-        if (analogX !== 0) {
-            // Target turning velocity based on turning input, using maximumAngularVelocity as benchmark
-            // Scaling the target turning speed to be extremely comfortable and precise (max ~8.5 rad/s)
-            const turnFactor = 8.5;
-            const targetAngVelY = -analogX * turnFactor;
-            
-            // Interpolate smoothly but instantly to target rotational velocity
-            bodyRef.current.setAngvel({
-              x: currentAngVel.x,
-              y: currentAngVel.y + (targetAngVelY - currentAngVel.y) * 0.35,
-              z: currentAngVel.z
-            }, true);
-        } else {
-            // Heavy rotational braking when no steering input is applied - stops the "million mph 360" effect!
-            bodyRef.current.setAngvel({
-              x: currentAngVel.x,
-              y: currentAngVel.y * 0.72,
-              z: currentAngVel.z
-            }, true);
-        }
-        
-        wantToFire = (keyboardInput.jump || virtualInput.action) && (actualWeaponType === 'flipper' || actualWeaponType === 'hammer' || actualWeaponType === 'crusher');
-      } else if (targetRef?.current) {
-        const targetPos = targetRef.current.translation();
-        
-        const dx = targetPos.x - myPos.x;
-        const dz = targetPos.z - myPos.z;
-        const dist = Math.sqrt(dx * dx + dz * dz);
-        const dot = dir.x * (dx/dist) + dir.z * (dz/dist);
-        
-        // Auto-righting if flipped
-        if (up.y < 0.8) {
-          const rightingAxis = new THREE.Vector3().crossVectors(up, new THREE.Vector3(0, 1, 0)).normalize();
-          const rightingStrength = (1.0 - up.y) * 8.0 * (opponentConfig.armor.weight / 100) * delta * 120;
-          bodyRef.current.applyTorqueImpulse({ x: rightingAxis.x * rightingStrength, y: 0, z: rightingAxis.z * rightingStrength }, true);
-          if (up.y < 0.0 && myPos.y < 1.0) {
-             bodyRef.current.applyImpulse({ x: 0, y: 15.0 * (opponentConfig.armor.weight / 100) * delta, z: 0 }, true);
+            const targetAngle = Math.atan2(dx, dz);
+            const currentYaw = Math.atan2(dir.x, dir.z);
+            let angleDiff = targetAngle - currentYaw;
+            while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+            while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+            steering = THREE.MathUtils.clamp(angleDiff * 2.0, -1, 1);
+          } else {
+            brake = 1.0;
           }
-        }
 
-        if (dist > 0.4) {
-          const speed = opponentConfig.motor.maxSpeed * 0.45 * 1.0;
-          const nx = dx / dist;
-          const nz = dz / dist;
+          const intent: BotControlIntent = {
+            throttle,
+            steering,
+            brake,
+            weaponCommand: isSpinning ? 1.0 : 0.0,
+            selfRightCommand: (up.y < 0.8) ? 1.0 : 0.0
+          };
+
+          const bPos = bodyRef.current.translation();
+          const bRot = bodyRef.current.rotation();
+          resolveGroundSupports(mState, [bPos.x, bPos.y, bPos.z], [bRot.x, bRot.y, bRot.z, bRot.w], assemblyPlan);
+
+          const bLinvel = bodyRef.current.linvel();
+          const bAngvel = bodyRef.current.angvel();
+          const { forces, reactionTorque } = updateWheelGroundDynamics(
+            mState,
+            intent,
+            [bLinvel.x, bLinvel.y, bLinvel.z],
+            [bAngvel.x, bAngvel.y, bAngvel.z],
+            [bRot.x, bRot.y, bRot.z, bRot.w],
+            [bPos.x, bPos.y, bPos.z],
+            assemblyPlan,
+            finalDelta
+          );
+
+          forces.forEach(f => {
+            bodyRef.current.applyImpulseAtPoint(
+              { x: f.force[0] * finalDelta, y: f.force[1] * finalDelta, z: f.force[2] * finalDelta },
+              { x: f.point[0], y: f.point[1], z: f.point[2] },
+              true
+            );
+          });
+
+          bodyRef.current.applyTorqueImpulse(
+            { x: reactionTorque[0] * finalDelta, y: reactionTorque[1] * finalDelta, z: reactionTorque[2] * finalDelta },
+            true
+          );
+
+          const weaponResult = updateWeaponDynamicsAndMomentum(
+            mState,
+            intent,
+            [bAngvel.x, bAngvel.y, bAngvel.z],
+            [bRot.x, bRot.y, bRot.z, bRot.w],
+            assemblyPlan,
+            finalDelta
+          );
+
+          bodyRef.current.applyTorqueImpulse(
+            { x: weaponResult.reactionTorque[0] * finalDelta, y: weaponResult.reactionTorque[1] * finalDelta, z: weaponResult.reactionTorque[2] * finalDelta },
+            true
+          );
+
+          const knockoutEval = evaluateMobilityAndKnockout(mState);
+          if (knockoutEval.isKilled && battleStatus === 'battle') {
+            damageBot('opponent', 100);
+          }
+
+          globalMechanicalState.opponent.current = mState;
+
+          if (dist < 1.8 && dot > 0.8 && (actualWeaponType === 'flipper' || actualWeaponType === 'hammer' || actualWeaponType === 'crusher')) {
+            wantToFire = true;
+          }
+        }
+      }
+
+      if (!isMechanicalActive) {
+        if (isPlayer) {
+          const keyboardInput = get();
+          const virtualInput = useGameStore.getState().virtualInput;
+          const forward = keyboardInput.forward || virtualInput.forward;
+          const backward = keyboardInput.backward || virtualInput.backward;
+          const left = keyboardInput.left || virtualInput.left;
+          const right = keyboardInput.right || virtualInput.right;
+
+           // Auto-righting if flipped
+          if (up.y < 0.8) {
+            const rightingAxis = new THREE.Vector3().crossVectors(up, new THREE.Vector3(0, 1, 0)).normalize();
+            const rightingStrength = (1.0 - up.y) * 8.0 * (config.armor.weight / 10) * delta * 120;
+            bodyRef.current.applyTorqueImpulse({ x: rightingAxis.x * rightingStrength, y: 0, z: rightingAxis.z * rightingStrength }, true);
+            if (up.y < 0.0 && myPos.y < 1.0) {
+               bodyRef.current.applyImpulse({ x: 0, y: 15.0 * (config.armor.weight / 10) * delta, z: 0 }, true);
+            }
+          }
+
+          const speed = config.motor.maxSpeed * 0.45 * 1.0;
+          const torque = config.motor.torque * 0.025 * 1.0;
           
-          // Drive forward if roughly facing the target
-          if (dot > 0.4) {
-            // Apply impulse along the robot's forward vector (dir) proportional to how directly it's facing the player
-            // Dampen speed significantly to prevent "shooting across the map"
-            const driveFactor = Math.max(0, dot);
-            bodyRef.current.applyImpulse({ x: dir.x * speed * delta * 5.0 * driveFactor, y: 0, z: dir.z * speed * delta * 5.0 * driveFactor }, true);
+          const analogY_val = virtualInput.analogY || 0;
+          const analogX_val = virtualInput.analogX || 0;
+          const analogY = analogY_val !== 0 ? analogY_val : (forward ? -1 : backward ? 1 : 0);
+          const analogX = analogX_val !== 0 ? analogX_val : (left ? -1 : right ? 1 : 0);
+
+          if (analogY !== 0) {
+              const driveScale = config.armor.weight / 10;
+              bodyRef.current.applyImpulse({ x: -dir.x * analogY * speed * delta * 15 * driveScale, y: 0, z: -dir.z * analogY * speed * delta * 15 * driveScale }, true);
+          } else {
+              // Apply forward/backward linear braking to make controls super sharp and responsive
+              const currentLinVel = bodyRef.current.linvel();
+              const forwardVel = dir.dot(new THREE.Vector3(currentLinVel.x, currentLinVel.y, currentLinVel.z));
+              if (Math.abs(forwardVel) > 0.05) {
+                 const brakeForce = dir.clone().multiplyScalar(-forwardVel * 0.12);
+                 bodyRef.current.setLinvel({
+                   x: currentLinVel.x + brakeForce.x,
+                   y: currentLinVel.y,
+                   z: currentLinVel.z + brakeForce.z
+                 }, true);
+              }
           }
           
-          // Smoothly steer towards the player using torque instead of forcefully setting rotation
-          const targetAngle = Math.atan2(nx, nz);
-          // Get current yaw (approximate from direction vector)
-          const currentYaw = Math.atan2(dir.x, dir.z);
+          // High quality directional controls with active rotational dampening
+          const currentAngVel = bodyRef.current.angvel();
+          if (analogX !== 0) {
+              // Target turning velocity based on turning input, using maximumAngularVelocity as benchmark
+              // Scaling the target turning speed to be extremely comfortable and precise (max ~8.5 rad/s)
+              const turnFactor = 8.5;
+              const targetAngVelY = -analogX * turnFactor;
+              
+              // Interpolate smoothly but instantly to target rotational velocity
+              bodyRef.current.setAngvel({
+                x: currentAngVel.x,
+                y: currentAngVel.y + (targetAngVelY - currentAngVel.y) * 0.35,
+                z: currentAngVel.z
+              }, true);
+          } else {
+              // Heavy rotational braking when no steering input is applied - stops the "million mph 360" effect!
+              bodyRef.current.setAngvel({
+                x: currentAngVel.x,
+                y: currentAngVel.y * 0.72,
+                z: currentAngVel.z
+              }, true);
+          }
           
-          // Smallest angle difference
-          let angleDiff = targetAngle - currentYaw;
-          while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
-          while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+          wantToFire = (keyboardInput.jump || virtualInput.action) && (actualWeaponType === 'flipper' || actualWeaponType === 'hammer' || actualWeaponType === 'crusher');
+        } else if (targetRef?.current) {
+          const targetPos = targetRef.current.translation();
           
-          // Apply torque proportional to the angle difference
-          const torqueAmt = angleDiff * opponentConfig.motor.torque * delta * 0.08; 
-          bodyRef.current.applyTorqueImpulse({ x: 0, y: torqueAmt, z: 0 }, true);
-        }
-        
-        if (dist < 1.8 && dot > 0.8 && (actualWeaponType === 'flipper' || actualWeaponType === 'hammer' || actualWeaponType === 'crusher')) {
-            wantToFire = true;
+          const dx = targetPos.x - myPos.x;
+          const dz = targetPos.z - myPos.z;
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          const dot = dir.x * (dx/dist) + dir.z * (dz/dist);
+          
+           // Auto-righting if flipped
+          if (up.y < 0.8) {
+            const rightingAxis = new THREE.Vector3().crossVectors(up, new THREE.Vector3(0, 1, 0)).normalize();
+            const rightingStrength = (1.0 - up.y) * 8.0 * (opponentConfig.armor.weight / 10) * delta * 120;
+            bodyRef.current.applyTorqueImpulse({ x: rightingAxis.x * rightingStrength, y: 0, z: rightingAxis.z * rightingStrength }, true);
+            if (up.y < 0.0 && myPos.y < 1.0) {
+               bodyRef.current.applyImpulse({ x: 0, y: 15.0 * (opponentConfig.armor.weight / 10) * delta, z: 0 }, true);
+            }
+          }
+
+          if (dist > 0.4) {
+            const speed = opponentConfig.motor.maxSpeed * 0.45 * 1.0;
+            const nx = dx / dist;
+            const nz = dz / dist;
+            
+            // Drive forward if roughly facing the target
+            if (dot > 0.4) {
+              // Apply impulse along the robot's forward vector (dir) proportional to how directly it's facing the player
+              // Dampen speed significantly to prevent "shooting across the map"
+              const driveFactor = Math.max(0, dot);
+              const driveScale = opponentConfig.armor.weight / 10;
+              bodyRef.current.applyImpulse({ x: dir.x * speed * delta * 5.0 * driveFactor * driveScale, y: 0, z: dir.z * speed * delta * 5.0 * driveFactor * driveScale }, true);
+            }
+            
+            // Smoothly steer towards the player using torque instead of forcefully setting rotation
+            const targetAngle = Math.atan2(nx, nz);
+            // Get current yaw (approximate from direction vector)
+            const currentYaw = Math.atan2(dir.x, dir.z);
+            
+            // Smallest angle difference
+            let angleDiff = targetAngle - currentYaw;
+            while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+            while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+            
+            // Apply torque proportional to the angle difference
+            const torqueAmt = angleDiff * opponentConfig.motor.torque * delta * 0.08; 
+            bodyRef.current.applyTorqueImpulse({ x: 0, y: torqueAmt, z: 0 }, true);
+          }
+          
+          if (dist < 1.8 && dot > 0.8 && (actualWeaponType === 'flipper' || actualWeaponType === 'hammer' || actualWeaponType === 'crusher')) {
+              wantToFire = true;
+          }
         }
       }
 
@@ -887,17 +1800,34 @@ const Bot = ({
                  useGameStore.getState().spawnDebris([targetPos.x, targetPos.y, targetPos.z], finalDamage * 8.0, impactVector);
                  useGameStore.getState().spawnSparks([targetPos.x, targetPos.y, targetPos.z], Math.floor(finalDamage * 4), actualWeaponType === 'hammer' ? '#FFD700' : '#FFFFFF');
                  
-                 const oppWeightMult = (isPlayer ? opponentConfig.armor.weight : config.armor.weight) / 100;
+                 // Dispatch combat impact event for visual denting solver
+                 window.dispatchEvent(new CustomEvent('combat-impact', {
+                   detail: {
+                     type: 'collision',
+                     className: 'weapon',
+                     impactEnergy: finalDamage * 10,
+                     damageAmount: finalDamage,
+                     position: [targetPos.x, targetPos.y, targetPos.z],
+                     attacker: isPlayer ? 'player' : 'opponent',
+                     defender: isPlayer ? 'opponent' : 'player',
+                     hitZone: 'front',
+                     defenderId: isPlayer ? 'opponent' : 'player',
+                     normal: [dir.x, dir.y, dir.z]
+                   }
+                 }));
+                 
+                 const oppWeightRaw = isPlayer ? opponentConfig.armor.weight : config.armor.weight;
+                 const oppWeightMult = Math.max(0.8, oppWeightRaw / 100);
 
                  if (actualWeaponType === 'flipper') {
-                     targetRef.current.applyImpulse({ x: dir.x * 15 * settings.impactImpulseScale / oppWeightMult, y: 20 * settings.impactImpulseScale / oppWeightMult, z: dir.z * 15 * settings.impactImpulseScale / oppWeightMult }, true);
-                     targetRef.current.applyTorqueImpulse({ x: (Math.random() - 0.5) * 20 * settings.impactImpulseScale, y: (Math.random() - 0.5) * 20 * settings.impactImpulseScale, z: (Math.random() - 0.5) * 20 * settings.impactImpulseScale }, true);
-                     bodyRef.current.applyImpulse({ x: -dir.x * 15 * 1.0, y: -10 * 1.0, z: -dir.z * 15 * 1.0 }, true); 
+                     targetRef.current.applyImpulse({ x: dir.x * 150 * settings.impactImpulseScale / oppWeightMult, y: 200 * settings.impactImpulseScale / oppWeightMult, z: dir.z * 150 * settings.impactImpulseScale / oppWeightMult }, true);
+                     targetRef.current.applyTorqueImpulse({ x: (Math.random() - 0.5) * 200 * settings.impactImpulseScale, y: (Math.random() - 0.5) * 200 * settings.impactImpulseScale, z: (Math.random() - 0.5) * 200 * settings.impactImpulseScale }, true);
+                     bodyRef.current.applyImpulse({ x: -dir.x * 150 * 1.0, y: -100 * 1.0, z: -dir.z * 150 * 1.0 }, true); 
                  } else if (actualWeaponType === 'hammer') {
-                     targetRef.current.applyImpulse({ x: 0, y: -60 * settings.impactImpulseScale / oppWeightMult, z: 0 }, true);
-                     bodyRef.current.applyImpulse({ x: 0, y: 30 * 1.0, z: 0 }, true); 
+                     targetRef.current.applyImpulse({ x: 0, y: -600 * settings.impactImpulseScale / oppWeightMult, z: 0 }, true);
+                     bodyRef.current.applyImpulse({ x: 0, y: 300 * 1.0, z: 0 }, true); 
                  } else if (actualWeaponType === 'crusher') {
-                     targetRef.current.applyImpulse({ x: -dir.x * 20 * settings.impactImpulseScale / oppWeightMult, y: -40 * settings.impactImpulseScale / oppWeightMult, z: -dir.z * 20 * settings.impactImpulseScale / oppWeightMult }, true);
+                     targetRef.current.applyImpulse({ x: -dir.x * 200 * settings.impactImpulseScale / oppWeightMult, y: -400 * settings.impactImpulseScale / oppWeightMult, z: -dir.z * 200 * settings.impactImpulseScale / oppWeightMult }, true);
                  }
              }
           }
@@ -909,14 +1839,15 @@ const Bot = ({
   });
 
   return (
-    <>
-      <group ref={meshRef} position={position} />
+    <BotOwnerContext.Provider value={isPlayer ? 'player' : 'opponent'}>
+      <DamageContext.Provider value={damageFactor}>
+        <group ref={meshRef} position={position} />
       
       <RigidBody ccd={true} 
         ref={bodyRef} 
         position={position} 
         colliders={false} 
-        mass={(currentBotConfig.armor.weight / 10) * settings.chassisMassScale} 
+        mass={currentBotConfig.armor.weight * settings.chassisMassScale} 
         type="dynamic" 
         lockRotations={false} 
         lockTranslations={false} 
@@ -988,7 +1919,7 @@ const Bot = ({
                }
                
                // Calculate Damage
-               const energyDmgScale = Math.min(impactEnergy * 0.05, 50);
+               const energyDmgScale = Math.min(impactEnergy * 0.005, 50);
                const dmgMult = settings.damageMultiplier;
                const glancingMult = className === 'direct' || className === 'heavy' || className === 'weapon' ? 1.0 : settings.glancingHitReduction;
                let baseDamage = energyDmgScale * dmgMult * glancingMult * settings.collisionBrutality * 0.1;
@@ -997,7 +1928,7 @@ const Bot = ({
                // --- HIGH IMPACT PHYSICS UPGRADE 1: Kinetic Collision Recoil & Rotational Instability ---
                if (impactEnergy > 2 && bodyRef.current && targetRef.current) {
                  // Scale impulse based on mass and speed
-                 const baseForce = Math.min(normalVelocity * 0.4, 10) * settings.impactImpulseScale;
+                 const baseForce = Math.min(normalVelocity * 4.0, 100) * settings.impactImpulseScale;
                  
                  // Calculate directional force vectors
                  const recoilDir = normalVec.clone().normalize();
@@ -1005,14 +1936,14 @@ const Bot = ({
                  const pushZ = recoilDir.z * baseForce;
                  
                  // Determine vertical pop/lift (heavy hits or spinner hits pop bots into the air!)
-                 const liftForce = (className === 'heavy' || className === 'weapon') ? (Math.min(normalVelocity * 0.3, 5) * settings.impactImpulseScale) : 0;
+                 const liftForce = (className === 'heavy' || className === 'weapon') ? (Math.min(normalVelocity * 3.0, 50) * settings.impactImpulseScale) : 0;
                  
                  // Apply repulsive linear impulses to push bots apart realistically
                  targetRef.current.applyImpulse({ x: pushX, y: liftForce, z: pushZ }, true);
                  bodyRef.current.applyImpulse({ x: -pushX, y: liftForce * 0.2, z: -pushZ }, true);
                  
                  // Apply angular torque impulses to induce realistic spinout, roll, or tipping
-                 const torquePower = Math.min(normalVelocity * 1.5, 12) * settings.impactImpulseScale;
+                 const torquePower = Math.min(normalVelocity * 15.0, 120) * settings.impactImpulseScale;
                  
                  // Defender wobbles, tips, and spins out violently
                  targetRef.current.applyTorqueImpulse({
@@ -1047,7 +1978,9 @@ const Bot = ({
                    position: contactPoint,
                    attacker: config.name,
                    defender: opponentConfig.name,
-                   hitZone
+                   hitZone,
+                   defenderId: otherId,
+                   normal: normal
                  }
                }));
                
@@ -1073,8 +2006,13 @@ const Bot = ({
                  useGameStore.getState().spawnSparks([contactPoint[0], contactPoint[1] + 0.2, contactPoint[2]], 40, "#FF3300"); 
                  useGameStore.getState().spawnDebris([contactPoint[0], contactPoint[1] + 0.2, contactPoint[2]], 15); 
                }
+               
                if (damageEvent) damageEvent.damageAmount = baseDamage;
                useGameStore.getState().processImpactEvent(damageEvent);
+               if (damageEvent && damageEvent.dentRequest) {
+                 window.dispatchEvent(new CustomEvent('dent-request', { detail: damageEvent.dentRequest }));
+               }
+
 
                const event = {
                  id: 'impact_' + now,
@@ -1152,8 +2090,9 @@ const Bot = ({
         ) : (
           resolvedParts.map((tr) => {
             const partDef = PART_TEMPLATES.find(p => p.templateId === tr.definitionId) as any;
-            const threshold = getPartFalloffThreshold(tr.instanceId, partDef?.type || '');
-            if (damageFactor > threshold) return null;
+            const mNode = mechanicalStateRef.current?.nodes.find(n => n.partInstanceId === tr.instanceId);
+            const isDetached = mNode && (mNode.failureState === 'detached' || mNode.failureState === 'failed');
+            if (isDetached) return null;
 
             if (partDef && partDef.colliders && partDef.colliders.length > 0) {
               return (
@@ -1183,9 +2122,9 @@ const Bot = ({
                     }
                     if (col.kind === 'capsule') {
                       return (
-                        <CylinderCollider 
+                        <CapsuleCollider 
                           key={`${tr.instanceId}-${idx}`}
-                          args={[col.dimensions[0] / 2, col.dimensions[1]]} 
+                          args={[Math.max(0.01, col.dimensions[0] - col.dimensions[1]) / 2, col.dimensions[1] / 2]} 
                           position={col.localPosition}
                           rotation={col.localRotation}
                           restitution={settings.collisionRestitution} friction={0.2} 
@@ -1196,12 +2135,29 @@ const Bot = ({
                   })}
                 </group>
               );
+            } else if (partDef) {
+               // Fallback collider based on part shape
+               const [w, h, d] = partDef.size || [0.5, 0.5, 0.5];
+               return (
+                 <group key={tr.instanceId} position={tr.world.position} rotation={tr.world.rotation}>
+                   {partDef.visualKind === 'cylinder' ? (
+                     <CylinderCollider 
+                       args={[d / 2, w / 2]} 
+                       restitution={settings.collisionRestitution} friction={0.2} 
+                     />
+                   ) : (
+                     <CuboidCollider 
+                       args={[w / 2, h / 2, d / 2]} 
+                       restitution={settings.collisionRestitution} friction={0.2} 
+                     />
+                   )}
+                 </group>
+               );
             }
-
-                        return null;
+            return null;
           })
         )}
-        
+
         <group ref={visualRootRef}>
           <BotDamageVisuals botId={isPlayer ? "player" : "opponent"} />
         {isCustom && currentBotConfig.customConfig && currentBotConfig.customConfig.parts && (
@@ -1211,8 +2167,9 @@ const Bot = ({
               const partDef = PART_TEMPLATES.find(p => p.templateId === tr.definitionId) as any;
               if (!part || !partDef) return null;
               
-              const threshold = getPartFalloffThreshold(tr.instanceId, partDef.type || partDef.category || '');
-              if (damageFactor > threshold) return null;
+              const mNode = mechanicalStateRef.current?.nodes.find(n => n.partInstanceId === tr.instanceId);
+              const isDetached = mNode && (mNode.failureState === 'detached' || mNode.failureState === 'failed');
+              if (isDetached) return null;
 
               const [w, h, d] = partDef.dimensions || partDef.size || [0.5,0.5,0.5];
               const color = part.color || partDef.color || '#fff';
@@ -1228,68 +2185,159 @@ const Bot = ({
                 >
                   <group name="visual-wrapper">
                     {visualKind === 'box' && (
-                      <mesh castShadow receiveShadow>
-                        <boxGeometry args={[w, h, d]} />
-                        <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
-                      </mesh>
+                      <RoundedBoxMesh size={[w, h, d]} color={color} />
                     )}
                     {visualKind === 'cylinder' && (
-                      <group name="WheelSpinGroup" rotation={pType === 'wheel' ? [0, 0, Math.PI / 2] : [0, 0, 0]}>
-                        <mesh castShadow receiveShadow>
-                          <cylinderGeometry args={[w, h, d, 16]} />
-                          <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
-                        </mesh>
-                        {/* Wheel details */}
-                        {pType === 'wheel' && (
-                          <>
-                            <mesh castShadow position={[0, d / 2 + 0.01, 0]} rotation={[Math.PI / 2, 0, 0]}>
-                              <cylinderGeometry args={[w * 0.4, w * 0.4, 0.05, 8]} />
-                              <meshStandardMaterial color="#555" metalness={0.9} />
-                            </mesh>
-                            {/* Rolling indicators */}
-                            {[0, 1, 2, 3].map((b) => {
-                              const angle = (b * Math.PI) / 2;
-                              return (
-                                <mesh 
-                                  key={b} 
-                                  castShadow 
-                                  position={[Math.cos(angle) * w * 0.6, d / 2 + 0.02, Math.sin(angle) * w * 0.6]}
-                                >
-                                  <boxGeometry args={[0.04, 0.03, 0.04]} />
-                                  <meshStandardMaterial color="#FFC107" metalness={0.9} />
+                      partDef?.templateId === 'weapon_drum' ? (
+                        <group name="DrumSpinner" rotation={[0, 0, 0]}>
+                          {/* Core Drum Barrel */}
+                          <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+                            <cylinderGeometry args={[0.3, 0.3, 0.65, 32]} />
+                            <meshStandardMaterial color="#2a2a2a" metalness={0.9} roughness={0.2} />
+                          </mesh>
+                          {/* Grooves & caps */}
+                          <mesh castShadow rotation={[0, 0, Math.PI / 2]} position={[0.2, 0, 0]}>
+                             <cylinderGeometry args={[0.31, 0.31, 0.05, 32]} />
+                             <meshStandardMaterial color={color} metalness={0.8} roughness={0.1} />
+                          </mesh>
+                          <mesh castShadow rotation={[0, 0, Math.PI / 2]} position={[-0.2, 0, 0]}>
+                             <cylinderGeometry args={[0.31, 0.31, 0.05, 32]} />
+                             <meshStandardMaterial color={color} metalness={0.8} roughness={0.1} />
+                          </mesh>
+                          {/* 8 staggered sharp cones */}
+                          {[
+                            { angle: 0, x: -0.22 },
+                            { angle: Math.PI / 4, x: -0.11 },
+                            { angle: Math.PI / 2, x: 0 },
+                            { angle: (3 * Math.PI) / 4, x: 0.11 },
+                            { angle: Math.PI, x: 0.22 },
+                            { angle: (5 * Math.PI) / 4, x: -0.16 },
+                            { angle: (3 * Math.PI) / 2, x: -0.05 },
+                            { angle: (7 * Math.PI) / 4, x: 0.16 },
+                          ].map((spike, idx) => {
+                            const radius = 0.3;
+                            const sy = Math.sin(spike.angle) * radius;
+                            const sz = Math.cos(spike.angle) * radius;
+                            return (
+                              <group key={idx} position={[spike.x, sy, sz]} rotation={[spike.angle, 0, 0]}>
+                                <mesh castShadow>
+                                  <boxGeometry args={[0.08, 0.06, 0.08]} />
+                                  <meshStandardMaterial color="#444" metalness={0.9} roughness={0.2} />
                                 </mesh>
-                              );
-                            })}
-                          </>
-                        )}
-                      </group>
+                                <mesh castShadow position={[0, 0.07, 0]}>
+                                  <coneGeometry args={[0.04, 0.12, 4]} />
+                                  <meshStandardMaterial color="#ff3300" metalness={0.9} roughness={0.1} emissive="#ff3300" emissiveIntensity={0.2} />
+                                </mesh>
+                              </group>
+                            );
+                          })}
+                        </group>
+                      ) : partDef?.templateId === 'weapon_spinner' ? (
+                        <group name="VerticalSpinnerDisk" rotation={[0, 0, 0]}>
+                          {/* Core Disk rotating along X axis */}
+                          <mesh castShadow receiveShadow rotation={[0, 0, Math.PI / 2]}>
+                            <cylinderGeometry args={[w, w, d, 24]} />
+                            <meshStandardMaterial color="#1a1a1a" metalness={0.95} roughness={0.1} />
+                          </mesh>
+                          {/* Metallic Trim Plate */}
+                          <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+                            <cylinderGeometry args={[w * 0.75, w * 0.75, d + 0.01, 16]} />
+                            <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
+                          </mesh>
+                          {/* Center Hub Cap */}
+                          <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+                            <cylinderGeometry args={[w * 0.25, w * 0.25, d + 0.02, 12]} />
+                            <meshStandardMaterial color="#e0e0e0" metalness={0.95} roughness={0.05} />
+                          </mesh>
+                          {/* Two heavy cutting teeth on the perimeter */}
+                          {[0, Math.PI].map((angle, idx) => {
+                            const sy = Math.sin(angle) * w * 0.85;
+                            const sz = Math.cos(angle) * w * 0.85;
+                            return (
+                              <group key={idx} position={[0, sy, sz]} rotation={[angle, 0, 0]}>
+                                <mesh castShadow>
+                                  <boxGeometry args={[d + 0.03, 0.05, w * 0.3]} />
+                                  <meshStandardMaterial color="#ff3300" metalness={0.95} roughness={0.15} emissive="#ff1100" emissiveIntensity={0.2} />
+                                </mesh>
+                              </group>
+                            );
+                          })}
+                        </group>
+                      ) : (
+                        <group name="WheelSpinGroup" rotation={(pType === 'wheel') ? [0, 0, Math.PI / 2] : [0, 0, 0]}>
+                          <mesh castShadow receiveShadow>
+                            <cylinderGeometry args={[w, w, d, 24]} />
+                            <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
+                          </mesh>
+                          {/* Wheel details */}
+                          {pType === 'wheel' && (
+                            <>
+                              {/* Metallic Alloy Rim */}
+                              <mesh castShadow position={[0, 0, 0]} rotation={[0, 0, 0]}>
+                                <cylinderGeometry args={[w * 0.65, w * 0.65, d + 0.01, 16]} />
+                                <meshStandardMaterial color="#2a2a2a" metalness={0.9} roughness={0.1} />
+                              </mesh>
+                              {/* Chrome Hub Cap */}
+                              <mesh castShadow position={[0, 0, 0]} rotation={[0, 0, 0]}>
+                                <cylinderGeometry args={[w * 0.25, w * 0.25, d + 0.02, 12]} />
+                                <meshStandardMaterial color="#e0e0e0" metalness={0.95} roughness={0.05} />
+                              </mesh>
+                              {/* 6 Radial spokes */}
+                              {[0, 1, 2, 3, 4, 5].map((s) => {
+                                const angle = (s * Math.PI) / 3;
+                                return (
+                                  <group key={`spoke-${s}`} rotation={[0, angle, 0]}>
+                                    <mesh castShadow position={[0, d / 2 + 0.01, w * 0.4]}>
+                                      <boxGeometry args={[w * 0.1, d * 0.2, w * 0.4]} />
+                                      <meshStandardMaterial color="#e0e0e0" metalness={0.9} roughness={0.1} />
+                                    </mesh>
+                                  </group>
+                                );
+                              })}
+                              {/* Lug Nuts on the chrome hub */}
+                              {[0, 1, 2, 3, 4, 5].map((b) => {
+                                const angle = (b * Math.PI) / 3;
+                                return (
+                                  <mesh 
+                                    key={`nut-${b}`} 
+                                    castShadow 
+                                    position={[Math.cos(angle) * w * 0.18, d / 2 + 0.02, Math.sin(angle) * w * 0.18]}
+                                  >
+                                    <cylinderGeometry args={[0.015, 0.015, 0.02, 6]} />
+                                    <meshStandardMaterial color="#ffffff" metalness={0.9} roughness={0.1} />
+                                  </mesh>
+                                );
+                              })}
+                              {/* Rolling indicators */}
+                              {[0, 1, 2, 3].map((b) => {
+                                const angle = (b * Math.PI) / 2;
+                                return (
+                                  <mesh 
+                                    key={`ind-${b}`} 
+                                    castShadow 
+                                    position={[Math.cos(angle) * w * 0.8, d / 2 + 0.02, Math.sin(angle) * w * 0.8]}
+                                  >
+                                    <boxGeometry args={[0.04, 0.02, 0.12]} />
+                                    <meshStandardMaterial color="#FF5500" metalness={0.8} emissive="#FF5500" emissiveIntensity={0.1} />
+                                  </mesh>
+                                );
+                              })}
+                            </>
+                          )}
+                        </group>
+                      )
                     )}
-                    {visualKind === 'wedge' && (
-                      <mesh castShadow receiveShadow>
-                        <boxGeometry args={[w, h, d]} />
-                        <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
-                      </mesh>
-                    )}
-                    {visualKind === 'slope' && (
-                      <mesh castShadow receiveShadow>
-                        <boxGeometry args={[w, h, d]} />
-                        <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
-                      </mesh>
+                    {(visualKind === 'wedge' || visualKind === 'slope') && (
+                      <WedgeMesh size={[w, h, d]} color={color} />
                     )}
                     {visualKind === 'capsule' && (
                       <mesh castShadow receiveShadow rotation={[0, 0, Math.PI/2]}>
-                        <capsuleGeometry args={[w/2, h, 16, 16]} />
+                        <capsuleGeometry args={[h/2, Math.max(0.01, w - h), 16, 16]} />
                         <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
                       </mesh>
                     )}
-                    {(!visualKind || (visualKind !== 'box' && visualKind !== 'cylinder')) && (
-                      <mesh castShadow receiveShadow>
-                        <boxGeometry args={[w, h, d]} />
-                        <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
-                      </mesh>
-                    )}
-                    {visualKind === 'wedge' && (
-                      <WedgeMesh size={[w,h,d]} color={color} />
+                    {(!visualKind || (visualKind !== 'box' && visualKind !== 'cylinder' && visualKind !== 'wedge' && visualKind !== 'slope' && visualKind !== 'capsule')) && (
+                      <RoundedBoxMesh size={[w, h, d]} color={color} />
                     )}
                   </group>
                 </group>
@@ -1298,36 +2346,40 @@ const Bot = ({
           </group>
         )}
 
+        {/* Global Damage Particles for Bot */}
+
         {!isCustom && (
           <group position={[0, 0.4, 0]}>
           {/* Main body rear (rendered for non-drum bots, as drum bot has a layered modular assembly) */}
           {actualWeaponType !== 'drum' && damageComponents?.rear?.visualState !== 'detached' && (
-            <mesh castShadow receiveShadow position={[0, 0, 0.25]}>
-              <boxGeometry args={[1.5, 0.4, 1.5]} />
-              <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.2} />
-            </mesh>
+            <group ref={rearGroupRef}>
+              <group position={[0, 0, 0.25]}>
+                <RoundedBoxMesh size={[1.5, 0.4, 1.5]} color={actualColor} />
+                {/* Detailed bevel trim on top */}
+                <group position={[0, 0.22, 0]}>
+                  <RoundedBoxMesh size={[1.1, 0.05, 1.1]} color="#1a1a1a" />
+                </group>
+              </group>
+            </group>
           )}
           
           {/* Weapon-specific customized front chassis plates (eliminates overlapping flipper scoop issues) */}
           {actualWeaponType === 'hammer' && damageComponents?.front?.visualState !== 'detached' && (
-            <mesh castShadow receiveShadow position={[0, -0.05, -0.85]} rotation={[0.25, 0, 0]}>
-              <boxGeometry args={[1.5, 0.1, 1.2]} />
-              <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.2} />
-            </mesh>
+            <group ref={frontGroupRef} position={[0, -0.05, -0.85]} rotation={[0.25, 0, 0]}>
+               <WedgeMesh size={[1.5, 0.2, 1.2]} color={actualColor} />
+            </group>
           )}
 
           {(actualWeaponType === 'spinner' || actualWeaponType === 'saw') && damageComponents?.front?.visualState !== 'detached' && (
-            <>
+            <group ref={frontGroupRef}>
               {/* Corner split protective bumpers (leaves center 100% clear for spinning blade clearances) */}
-              <mesh castShadow receiveShadow position={[-0.6, -0.05, -0.85]} rotation={[0.25, 0.1, 0]}>
-                <boxGeometry args={[0.3, 0.1, 1.0]} />
-                <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.2} />
-              </mesh>
-              <mesh castShadow receiveShadow position={[0.6, -0.05, -0.85]} rotation={[0.25, -0.1, 0]}>
-                <boxGeometry args={[0.3, 0.1, 1.0]} />
-                <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.2} />
-              </mesh>
-            </>
+              <group position={[-0.6, -0.05, -0.85]} rotation={[0.25, 0.1, 0]}>
+                <WedgeMesh size={[0.4, 0.2, 1.0]} color={actualColor} />
+              </group>
+              <group position={[0.6, -0.05, -0.85]} rotation={[0.25, -0.1, 0]}>
+                <WedgeMesh size={[0.4, 0.2, 1.0]} color={actualColor} />
+              </group>
+            </group>
           )}
 
           {/* Elite Upgrade 5: Layered drum-vehicle visual assembly with high-fidelity components */}
@@ -1336,44 +2388,37 @@ const Bot = ({
               {/* 1. Structural Truss Chassis Frame */}
               <group name="StructuralChassisFrame">
                 {/* Heavy duty lower monocoque tub */}
-                <mesh castShadow receiveShadow position={[0, -0.05, 0.25]}>
-                  <boxGeometry args={[1.2, 0.32, 1.4]} />
-                  <meshStandardMaterial color="#17181a" metalness={0.95} roughness={0.4} />
-                </mesh>
+                <group position={[0, -0.05, 0.25]}>
+                  <RoundedBoxMesh size={[1.2, 0.32, 1.4]} color="#17181a" />
+                </group>
                 {/* Lateral structural braces (Steel rods) */}
-                <mesh castShadow position={[-0.58, 0.1, 0.25]}>
-                  <boxGeometry args={[0.06, 0.06, 1.3]} />
-                  <meshStandardMaterial color="#3a3c3e" metalness={0.9} roughness={0.1} />
-                </mesh>
-                <mesh castShadow position={[0.58, 0.1, 0.25]}>
-                  <boxGeometry args={[0.06, 0.06, 1.3]} />
-                  <meshStandardMaterial color="#3a3c3e" metalness={0.9} roughness={0.1} />
-                </mesh>
+                <group position={[-0.58, 0.1, 0.25]}>
+                  <RoundedBoxMesh size={[0.06, 0.06, 1.3]} color="#3a3c3e" />
+                </group>
+                <group position={[0.58, 0.1, 0.25]}>
+                  <RoundedBoxMesh size={[0.06, 0.06, 1.3]} color="#3a3c3e" />
+                </group>
                 {/* Heavy engine frame enclosure */}
-                <mesh castShadow position={[0, 0.15, 0.75]}>
-                  <boxGeometry args={[0.75, 0.22, 0.35]} />
-                  <meshStandardMaterial color="#0b0c0d" metalness={0.85} roughness={0.6} />
-                </mesh>
+                <group position={[0, 0.15, 0.75]}>
+                  <RoundedBoxMesh size={[0.75, 0.22, 0.35]} color="#0b0c0d" />
+                </group>
               </group>
 
               {/* 2. Dynamic Armor Panels with high-fidelity damage response */}
               {/* Top Deflector Shield - completely detaches (blown off) when health < 45% */}
               {botHealth >= 45 && (
                 <group 
+                  ref={topGroupRef}
                   name="TopArmorDeflector"
                   position={[0, 0.25 - damageFactor * 0.05, -0.3 + damageFactor * 0.1]}
                   rotation={[0.1 + damageFactor * 0.15, damageFactor * 0.1, 0]}
                 >
-                  <mesh castShadow receiveShadow>
-                    <boxGeometry args={[1.45, 0.08, 0.85]} />
-                    <meshStandardMaterial 
-                      color={actualColor} 
-                      metalness={0.8} 
-                      roughness={0.18} 
-                      emissive={damageFactor > 0.35 ? "#FF1500" : "#000000"}
-                      emissiveIntensity={damageFactor * 0.4}
-                    />
-                  </mesh>
+                  <RoundedBoxMesh 
+                    size={[1.45, 0.08, 0.85]} 
+                    color={actualColor} 
+                    emissive={damageFactor > 0.35 ? "#FF1500" : "#000000"} 
+                    emissiveIntensity={damageFactor * 0.4} 
+                  />
                   {/* Heavy industrial rivets */}
                   <mesh castShadow position={[-0.6, 0.05, 0.3]}>
                     <cylinderGeometry args={[0.02, 0.02, 0.04, 6]} />
@@ -1389,64 +2434,54 @@ const Bot = ({
               {/* Left Side Armor plate sags & deforms as health drops */}
               {damageFactor <= 0.75 && (
                 <group 
+                  ref={leftGroupRef}
                   name="LeftResponsiveArmor"
                   position={[-0.78, damageFactor > 0.3 ? -damageFactor * 0.12 : 0, 0.25]}
                   rotation={[0, 0, damageFactor > 0.3 ? -damageFactor * 0.25 : 0]}
                 >
-                  <mesh castShadow receiveShadow>
-                    <boxGeometry args={[0.08, 0.36, 1.35]} />
-                    <meshStandardMaterial 
-                      color="#252525" 
-                      metalness={0.95} 
-                      roughness={0.3} 
-                      emissive={damageFactor > 0.4 ? "#3d1100" : "#000000"}
-                    />
-                  </mesh>
+                  <RoundedBoxMesh 
+                    size={[0.08, 0.36, 1.35]} 
+                    color="#252525" 
+                    emissive={damageFactor > 0.4 ? "#3d1100" : "#000000"} 
+                  />
                 </group>
               )}
 
               {/* Right Side Armor plate sags & deforms as health drops */}
               {damageFactor <= 0.85 && (
                 <group 
+                  ref={rightGroupRef}
                   name="RightResponsiveArmor"
                   position={[0.78, damageFactor > 0.5 ? -damageFactor * 0.16 : 0, 0.25]}
                   rotation={[0, 0, damageFactor > 0.5 ? damageFactor * 0.32 : 0]}
                 >
-                  <mesh castShadow receiveShadow>
-                    <boxGeometry args={[0.08, 0.36, 1.35]} />
-                    <meshStandardMaterial 
-                      color="#252525" 
-                      metalness={0.95} 
-                      roughness={0.3} 
-                      emissive={damageFactor > 0.6 ? "#3d1100" : "#000000"}
-                    />
-                  </mesh>
+                  <RoundedBoxMesh 
+                    size={[0.08, 0.36, 1.35]} 
+                    color="#252525" 
+                    emissive={damageFactor > 0.6 ? "#3d1100" : "#000000"} 
+                  />
                 </group>
               )}
 
               {/* Rear Bumper protection sags and tilts */}
               <group 
+                ref={rearGroupRef}
                 name="RearResponsiveBumper"
                 position={[0, -0.05 - damageFactor * 0.1, 0.95]}
                 rotation={[damageFactor > 0.45 ? damageFactor * 0.22 : 0, 0, 0]}
               >
-                <mesh castShadow receiveShadow>
-                  <boxGeometry args={[1.4, 0.22, 0.14]} />
-                  <meshStandardMaterial color="#141414" metalness={0.8} roughness={0.5} />
-                </mesh>
+                <RoundedBoxMesh size={[1.4, 0.22, 0.14]} color="#141414" />
               </group>
 
               {/* 3. Heavy Drum Mount Frame */}
               <group name="HeavyDrumMount" position={[0, -0.1, -0.75]}>
                 {/* Dual supporting arm brackets */}
-                <mesh castShadow position={[-0.64, 0, 0]}>
-                  <boxGeometry args={[0.15, 0.35, 0.82]} />
-                  <meshStandardMaterial color="#1e1f22" metalness={0.9} roughness={0.3} />
-                </mesh>
-                <mesh castShadow position={[0.64, 0, 0]}>
-                  <boxGeometry args={[0.15, 0.35, 0.82]} />
-                  <meshStandardMaterial color="#1e1f22" metalness={0.9} roughness={0.3} />
-                </mesh>
+                <group position={[-0.64, 0, 0]}>
+                  <RoundedBoxMesh size={[0.15, 0.35, 0.82]} color="#1e1f22" />
+                </group>
+                <group position={[0.64, 0, 0]}>
+                  <RoundedBoxMesh size={[0.15, 0.35, 0.82]} color="#1e1f22" />
+                </group>
                 {/* Heavy hydraulics cylinder detail */}
                 <mesh castShadow position={[-0.72, 0.08, 0.15]} rotation={[Math.PI / 4, 0, 0]}>
                   <cylinderGeometry args={[0.035, 0.035, 0.4, 8]} />
@@ -1472,37 +2507,42 @@ const Bot = ({
           {actualWeaponType === 'crusher' && (
             <>
               {/* Lower stationary support clamp fork jaws */}
-              <mesh castShadow receiveShadow position={[-0.35, -0.1, -0.9]} rotation={[0.05, 0.15, 0]}>
-                <boxGeometry args={[0.1, 0.08, 0.9]} />
-                <meshStandardMaterial color="#444" metalness={0.9} roughness={0.1} />
-              </mesh>
-              <mesh castShadow receiveShadow position={[0.35, -0.1, -0.9]} rotation={[0.05, -0.15, 0]}>
-                <boxGeometry args={[0.1, 0.08, 0.9]} />
-                <meshStandardMaterial color="#444" metalness={0.9} roughness={0.1} />
-              </mesh>
+              <group position={[-0.35, -0.1, -0.9]} rotation={[0.05, 0.15, 0]}>
+                <RoundedBoxMesh size={[0.1, 0.08, 0.9]} color="#444" />
+              </group>
+              <group position={[0.35, -0.1, -0.9]} rotation={[0.05, -0.15, 0]}>
+                <RoundedBoxMesh size={[0.1, 0.08, 0.9]} color="#444" />
+              </group>
             </>
           )}
           
           {/* Side armor panels (rendered only for non-drum bots, as drum has custom responsive side plates) */}
-          {actualWeaponType !== 'drum' && damageComponents?.rear?.visualState !== 'detached' && (
+          {actualWeaponType !== 'drum' && (
             <>
-              <mesh castShadow receiveShadow position={[0.8, 0, 0]}>
-                <boxGeometry args={[0.15, 0.5, 2.1]} />
-                <meshStandardMaterial color="#333" metalness={0.9} roughness={0.3} />
-              </mesh>
-              <mesh castShadow receiveShadow position={[-0.8, 0, 0]}>
-                <boxGeometry args={[0.15, 0.5, 2.1]} />
-                <meshStandardMaterial color="#333" metalness={0.9} roughness={0.3} />
-              </mesh>
+              {damageComponents?.left?.visualState !== 'detached' && (
+                <group ref={leftGroupRef}>
+                  <group position={[-0.8, 0, 0]}>
+                    <RoundedBoxMesh size={[0.15, 0.5, 2.1]} color="#333" />
+                  </group>
+                </group>
+              )}
+              {damageComponents?.right?.visualState !== 'detached' && (
+                <group ref={rightGroupRef}>
+                  <group position={[0.8, 0, 0]}>
+                    <RoundedBoxMesh size={[0.15, 0.5, 2.1]} color="#333" />
+                  </group>
+                </group>
+              )}
             </>
           )}
 
           {/* Engine block (rendered only for non-drum bots, as drum has custom frame pack) */}
           {actualWeaponType !== 'drum' && damageComponents?.rear?.visualState !== 'detached' && (
-            <mesh castShadow position={[0, 0.25, 0.8]}>
-              <boxGeometry args={[0.8, 0.2, 0.4]} />
-              <meshStandardMaterial color="#222" metalness={0.9} roughness={0.6} />
-            </mesh>
+            <group ref={rearGroupRef}>
+              <group position={[0, 0.25, 0.8]}>
+                <RoundedBoxMesh size={[0.8, 0.2, 0.4]} color="#222" />
+              </group>
+            </group>
           )}
 
           {/* High-fidelity Weapon Systems */}
@@ -1519,47 +2559,38 @@ const Bot = ({
                 {/* Scoop mesh: sloped wedge plate integrated with front chassis wedge */}
                 <group position={[0, 0.06, -0.5]} rotation={[0.25, 0, 0]}>
                   {/* Flipper main scoop plate */}
-                  <mesh castShadow receiveShadow>
-                    <boxGeometry args={[1.35, 0.05, 1.15]} />
-                    <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.3} />
-                  </mesh>
+                  <WedgeMesh size={[1.35, 0.05, 1.15]} color={actualColor} />
                   {/* Hardened steel wedge teeth */}
-                  <mesh castShadow position={[0.5, -0.01, -0.6]}>
-                    <boxGeometry args={[0.2, 0.03, 0.2]} />
-                    <meshStandardMaterial color="#888" metalness={0.9} roughness={0.1} />
-                  </mesh>
-                  <mesh castShadow position={[-0.5, -0.01, -0.6]}>
-                    <boxGeometry args={[0.2, 0.03, 0.2]} />
-                    <meshStandardMaterial color="#888" metalness={0.9} roughness={0.1} />
-                  </mesh>
-                  <mesh castShadow position={[0, -0.01, -0.6]}>
-                    <boxGeometry args={[0.2, 0.03, 0.2]} />
-                    <meshStandardMaterial color="#888" metalness={0.9} roughness={0.1} />
-                  </mesh>
+                  <group position={[0.5, -0.01, -0.6]}>
+                    <WedgeMesh size={[0.2, 0.03, 0.2]} color="#888" />
+                  </group>
+                  <group position={[-0.5, -0.01, -0.6]}>
+                    <WedgeMesh size={[0.2, 0.03, 0.2]} color="#888" />
+                  </group>
+                  <group position={[0, -0.01, -0.6]}>
+                    <WedgeMesh size={[0.2, 0.03, 0.2]} color="#888" />
+                  </group>
                 </group>
               </group>
 
               {/* Pneumatic Cylinder (Chassis Mount) */}
               <group ref={pistonCylinderRef}>
                 {/* Cylinder mounting block */}
-                <mesh castShadow position={[0, 0, 0]}>
-                  <boxGeometry args={[0.18, 0.12, 0.12]} />
-                  <meshStandardMaterial color="#222" metalness={0.8} roughness={0.4} />
-                </mesh>
+                <group position={[0, 0, 0]}>
+                  <RoundedBoxMesh size={[0.18, 0.12, 0.12]} color="#222" />
+                </group>
                 {/* Main cylinder body */}
                 <mesh castShadow position={[0, 0, 0.225]} rotation={[Math.PI / 2, 0, 0]}>
                   <cylinderGeometry args={[0.075, 0.075, 0.45, 16]} />
                   <meshStandardMaterial color="#aaa" metalness={0.95} roughness={0.1} />
                 </mesh>
               </group>
-
               {/* Pneumatic Piston Rod (Arm Mount) */}
               <group ref={pistonRodRef}>
                 {/* Rod mounting block */}
-                <mesh castShadow position={[0, 0, 0]}>
-                  <boxGeometry args={[0.12, 0.08, 0.08]} />
-                  <meshStandardMaterial color="#333" metalness={0.8} roughness={0.4} />
-                </mesh>
+                <group position={[0, 0, 0]}>
+                  <RoundedBoxMesh size={[0.12, 0.08, 0.08]} color="#333" />
+                </group>
                 {/* Slidable steel shaft */}
                 <mesh castShadow position={[0, 0, 0.225]} rotation={[Math.PI / 2, 0, 0]}>
                   <cylinderGeometry args={[0.035, 0.035, 0.45, 16]} />
@@ -1572,14 +2603,12 @@ const Bot = ({
           {actualWeaponType === 'hammer' && damageComponents?.front?.visualState !== 'detached' && (
             <>
               {/* Heavy support A-frame towers */}
-              <mesh castShadow position={[0.45, 0.0, 0.2]} rotation={[0, 0, 0.12]}>
-                <boxGeometry args={[0.1, 0.6, 0.25]} />
-                <meshStandardMaterial color="#333" metalness={0.8} roughness={0.4} />
-              </mesh>
-              <mesh castShadow position={[-0.45, 0.0, 0.2]} rotation={[0, 0, -0.12]}>
-                <boxGeometry args={[0.1, 0.6, 0.25]} />
-                <meshStandardMaterial color="#333" metalness={0.8} roughness={0.4} />
-              </mesh>
+              <group position={[0.45, 0.0, 0.2]} rotation={[0, 0, 0.12]}>
+                <RoundedBoxMesh size={[0.1, 0.6, 0.25]} color="#333" />
+              </group>
+              <group position={[-0.45, 0.0, 0.2]} rotation={[0, 0, -0.12]}>
+                <RoundedBoxMesh size={[0.1, 0.6, 0.25]} color="#333" />
+              </group>
               
               {/* Main horizontal axle pin */}
               <mesh castShadow position={[0, 0.25, 0.2]} rotation={[0, 0, Math.PI / 2]}>
@@ -1590,17 +2619,13 @@ const Bot = ({
               {/* Sledgehammer arm and head group (pivots around axle) */}
               <group ref={weaponRef} position={[0, 0.25, 0.2]}>
                 {/* Heavy mechanical arm extending up/forward */}
-                <mesh castShadow position={[0, 0.6, 0]}>
-                  <boxGeometry args={[0.08, 1.2, 0.08]} />
-                  <meshStandardMaterial color="#555" metalness={0.8} roughness={0.3} />
-                </mesh>
+                <group position={[0, 0.6, 0]}>
+                  <RoundedBoxMesh size={[0.08, 1.2, 0.08]} color="#555" />
+                </group>
                 
                 {/* Sledgehammer massive double-sided head */}
                 <group position={[0, 1.2, 0]}>
-                  <mesh castShadow>
-                    <boxGeometry args={[0.55, 0.32, 0.7]} />
-                    <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.3} />
-                  </mesh>
+                  <RoundedBoxMesh size={[0.55, 0.32, 0.7]} color={actualColor} />
                   {/* Heavy impact spikes */}
                   <mesh castShadow position={[0, 0, -0.38]} rotation={[Math.PI / 2, 0, 0]}>
                     <coneGeometry args={[0.12, 0.15, 6]} />
@@ -1661,10 +2686,9 @@ const Bot = ({
                   return (
                     <group key={idx} position={[spike.x, sy, sz]} rotation={[spike.angle, 0, 0]}>
                       {/* Heavy spike base */}
-                      <mesh castShadow>
-                        <boxGeometry args={[0.15, 0.12, 0.15]} />
-                        <meshStandardMaterial color="#444" metalness={0.9} roughness={0.2} />
-                      </mesh>
+                      <group position={[0, 0, 0]}>
+                        <RoundedBoxMesh size={[0.15, 0.12, 0.15]} color="#444" />
+                      </group>
                       {/* Sharp steel ripping tooth/spike pointing radially outward */}
                       <mesh name="DrumTooth" castShadow position={[0, 0.14, 0]} rotation={[0, 0, 0]}>
                         <coneGeometry args={[0.07, 0.24, 4]} />
@@ -1706,10 +2730,9 @@ const Bot = ({
           {actualWeaponType === 'crusher' && damageComponents?.front?.visualState !== 'detached' && (
             <>
               {/* Lower Jaw (fixed to bottom-front of chassis) */}
-              <mesh castShadow position={[0, -0.22, -0.95]}>
-                <boxGeometry args={[0.7, 0.08, 0.9]} />
-                <meshStandardMaterial color="#222" metalness={0.8} roughness={0.4} />
-              </mesh>
+              <group position={[0, -0.22, -0.95]}>
+                <RoundedBoxMesh size={[0.7, 0.08, 0.9]} color="#222" />
+              </group>
               {/* Lower Jaw sharp wedge spikes */}
               <mesh castShadow position={[0.2, -0.22, -1.45]} rotation={[Math.PI / 2, 0, 0]}>
                 <coneGeometry args={[0.06, 0.15, 4]} />
@@ -1719,14 +2742,13 @@ const Bot = ({
                 <coneGeometry args={[0.06, 0.15, 4]} />
                 <meshStandardMaterial color="#aaa" metalness={0.9} />
               </mesh>
-
+              
               {/* Upper crushing claw (pivots down) */}
               <group ref={weaponRef} position={[0, 0.15, -0.5]}>
                 {/* Crusher arm extending forward and bending down */}
-                <mesh castShadow position={[0, 0.1, -0.45]} rotation={[-Math.PI / 10, 0, 0]}>
-                  <boxGeometry args={[0.22, 0.22, 0.9]} />
-                  <meshStandardMaterial color={actualColor} metalness={0.8} roughness={0.3} />
-                </mesh>
+                <group position={[0, 0.1, -0.45]} rotation={[-Math.PI / 10, 0, 0]}>
+                  <RoundedBoxMesh size={[0.22, 0.22, 0.9]} color={actualColor} />
+                </group>
                 {/* Dangerous downward spike beak */}
                 <mesh castShadow position={[0, -0.1, -0.9]} rotation={[Math.PI / 4, 0, 0]}>
                   <coneGeometry args={[0.08, 0.45, 4]} />
@@ -1749,14 +2771,12 @@ const Bot = ({
                 <meshStandardMaterial color="#444" metalness={0.8} roughness={0.2} />
               </mesh>
               {/* Opposing high-inertia impact teeth */}
-              <mesh castShadow position={[0.85, 0, 0]}>
-                <boxGeometry args={[0.3, 0.1, 0.18]} />
-                <meshStandardMaterial color="#FFC107" metalness={0.9} />
-              </mesh>
-              <mesh castShadow position={[-0.85, 0, 0]}>
-                <boxGeometry args={[0.3, 0.1, 0.18]} />
-                <meshStandardMaterial color="#FFC107" metalness={0.9} />
-              </mesh>
+              <group position={[0.85, 0, 0]}>
+                <WedgeMesh size={[0.3, 0.1, 0.18]} color="#FFC107" />
+              </group>
+              <group position={[-0.85, 0, 0]} rotation={[0, Math.PI, 0]}>
+                <WedgeMesh size={[0.3, 0.1, 0.18]} color="#FFC107" />
+              </group>
               {/* Drive belt/chain housing extending to chassis */}
               <mesh castShadow position={[0, 0, 0.5]} rotation={[Math.PI / 2, 0, 0]}>
                 <cylinderGeometry args={[0.06, 0.06, 0.8, 12]} />
@@ -1781,15 +2801,13 @@ const Bot = ({
               {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => {
                 const angle = (i * Math.PI) / 4;
                 return (
-                  <mesh 
+                  <group 
                     key={i}
-                    castShadow 
                     position={[Math.cos(angle) * 0.85, 0, Math.sin(angle) * 0.85]} 
                     rotation={[0, -angle, 0]}
                   >
-                    <boxGeometry args={[0.1, 0.02, 0.1]} />
-                    <meshStandardMaterial color="#aaa" metalness={0.9} />
-                  </mesh>
+                    <WedgeMesh size={[0.1, 0.02, 0.1]} color="#aaa" />
+                  </group>
                 );
               })}
               {/* Drive belt/chain housing extending to chassis */}
@@ -1833,16 +2851,33 @@ const Bot = ({
                     const dnx = dx / dDist;
                     const dnz = dz / dDist;
                     
-                    const targetWeightMult = (isPlayer ? opponentConfig.armor.weight : config.armor.weight) / 100;
-                    const pushForce = 0.5 * Math.abs(currentRPM.current) * settings.impactImpulseScale / targetWeightMult;
+                    const targetWeightRaw = isPlayer ? opponentConfig.armor.weight : config.armor.weight;
+                    const targetWeightMult = Math.max(0.8, targetWeightRaw / 100);
+                    const pushForce = 5.0 * Math.abs(currentRPM.current) * settings.impactImpulseScale / targetWeightMult;
                     
-                    targetRef.current.applyImpulse({ x: dnx * pushForce, y: 8 * settings.impactImpulseScale / targetWeightMult, z: dnz * pushForce }, true);
+                    targetRef.current.applyImpulse({ x: dnx * pushForce, y: 80 * settings.impactImpulseScale / targetWeightMult, z: dnz * pushForce }, true);
                     bodyRef.current.applyImpulse({ x: -dnx * pushForce * 0.4, y: 0, z: -dnz * pushForce * 0.4 }, true);
                     
                     const pos = bodyRef.current.translation();
                     const impactVector = [dnx * pushForce * 0.5, 5, dnz * pushForce * 0.5] as [number, number, number];
                     useGameStore.getState().spawnDebris([pos.x, pos.y, pos.z], finalDamage * 10, impactVector);
                     useGameStore.getState().spawnSparks([pos.x, pos.y, pos.z], Math.floor(finalDamage * 5), '#FFAA00');
+
+                    // Dispatch combat impact event for visual denting solver
+                    window.dispatchEvent(new CustomEvent('combat-impact', {
+                      detail: {
+                        type: 'collision',
+                        className: 'weapon',
+                        impactEnergy: finalDamage * 10,
+                        damageAmount: finalDamage,
+                        position: [targetPos.x, targetPos.y, targetPos.z],
+                        attacker: isPlayer ? 'player' : 'opponent',
+                        defender: isPlayer ? 'opponent' : 'player',
+                        hitZone: dnx > 0.5 ? 'right' : dnx < -0.5 ? 'left' : dnz > 0.5 ? 'front' : 'rear',
+                        defenderId: target,
+                        normal: [dnx, 0, dnz]
+                      }
+                    }));
                   }
                   currentRPM.current *= 0.5;
                 }
@@ -1923,14 +2958,15 @@ const Bot = ({
                     }
                     
                     // Impulses
-                    const targetWeightMult = (isPlayer ? opponentConfig.armor.weight : config.armor.weight) / 100;
+                    const targetWeightRaw = isPlayer ? opponentConfig.armor.weight : config.armor.weight;
+                    const targetWeightMult = Math.max(0.8, targetWeightRaw / 100);
                     
                     // Direct hit applies massive vertical lift and horizontal push
                     // Glancing hit applies less lift, more deflection
-                    const maxLift = 60 * settings.impactImpulseScale;
-                    const maxPush = 40 * settings.impactImpulseScale;
-                    const liftForce = Math.min((isDirect ? 40 : 20) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxLift);
-                    const pushForce = Math.min((isDirect ? 25 : 10) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxPush);
+                    const maxLift = 600 * settings.impactImpulseScale;
+                    const maxPush = 400 * settings.impactImpulseScale;
+                    const liftForce = Math.min((isDirect ? 400 : 200) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxLift);
+                    const pushForce = Math.min((isDirect ? 250 : 100) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxPush);
                     
                     targetBody.applyImpulse({ x: collisionNormal.x * pushForce, y: liftForce, z: collisionNormal.z * pushForce }, true);
                     
@@ -1945,6 +2981,22 @@ const Bot = ({
                     // Effects
                     const impactY = (tPos.y + sPos.y) * 0.5;
                     useGameStore.getState().spawnSparks([sPos.x + collisionNormal.x * 1.0, impactY, sPos.z + collisionNormal.z * 1.0], Math.floor(finalDamage * 8), '#FF4400');
+
+                    // Dispatch combat impact event for visual denting solver
+                    window.dispatchEvent(new CustomEvent('combat-impact', {
+                      detail: {
+                        type: 'collision',
+                        className: 'weapon',
+                        impactEnergy: finalDamage * 10,
+                        damageAmount: finalDamage,
+                        position: [tPos.x, tPos.y, tPos.z],
+                        attacker: isPlayer ? 'player' : 'opponent',
+                        defender: isPlayer ? 'opponent' : 'player',
+                        hitZone: collisionNormal.x > 0.5 ? 'right' : collisionNormal.x < -0.5 ? 'left' : collisionNormal.z > 0.5 ? 'front' : 'rear',
+                        defenderId: targetId,
+                        normal: [collisionNormal.x, collisionNormal.y, collisionNormal.z]
+                      }
+                    }));
                     
                     if (isDirect) {
                       useGameStore.getState().spawnDebris([sPos.x + collisionNormal.x * 1.0, impactY, sPos.z + collisionNormal.z * 1.0], finalDamage * 10, [collisionNormal.x * pushForce * 0.1, liftForce * 0.1, collisionNormal.z * pushForce * 0.1]);
@@ -2080,7 +3132,8 @@ const Bot = ({
         
                 </group>
       </RigidBody>
-    </>
+    </DamageContext.Provider>
+    </BotOwnerContext.Provider>
   );
 };
 
@@ -2193,7 +3246,27 @@ const UnifiedVisualEffectsManager = () => {
   const sparksList = useGameStore(s => s.sparks);
   const sparksMeshRef = useRef<THREE.InstancedMesh>(null);
   const smokeMeshRef = useRef<THREE.InstancedMesh>(null);
+  const fireMeshRef = useRef<THREE.InstancedMesh>(null);
   const dummyObj = useMemo(() => new THREE.Object3D(), []);
+
+  // Shared soft radial gradient texture for volumetric smoke/fire puffs
+  const softParticleTexture = useMemo(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+      gradient.addColorStop(0, 'rgba(255, 255, 255, 1.0)');
+      gradient.addColorStop(0.2, 'rgba(255, 255, 255, 0.85)');
+      gradient.addColorStop(0.55, 'rgba(255, 255, 255, 0.2)');
+      gradient.addColorStop(1.0, 'rgba(255, 255, 255, 0.0)');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, 64, 64);
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    return texture;
+  }, []);
 
   const lightRefs = useRef<(THREE.PointLight | null)[]>([]);
   const lightActiveIndex = useRef(0);
@@ -2322,8 +3395,10 @@ const UnifiedVisualEffectsManager = () => {
         const p = sparkParticles.current[i];
         dummyObj.position.copy(p.pos);
         const speedSq = p.vel.lengthSq();
-        const stretch = Math.max(1.0, speedSq * 0.015);
-        dummyObj.scale.set(p.size, p.size, p.size * stretch);
+        // Dynamic velocity-aligned stretching
+        const stretch = Math.max(1.5, speedSq * 0.022);
+        // Make them needle-thin for spectacular visual realism!
+        dummyObj.scale.set(p.size * 0.25, p.size * 0.25, p.size * stretch);
         
         if (speedSq > 0.1) {
           dummyObj.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), p.vel.clone().normalize());
@@ -2335,7 +3410,8 @@ const UnifiedVisualEffectsManager = () => {
         sparksMeshRef.current.setMatrixAt(i, dummyObj.matrix);
 
         const fade = Math.max(0, 1 - (p.age / p.maxAge));
-        const col = p.color.clone().multiplyScalar(fade * 3.5);
+        // High intensity bloom/emissive multiplier
+        const col = p.color.clone().multiplyScalar(fade * 5.0);
         sparksMeshRef.current.setColorAt(i, col);
       }
       if (count > 0) {
@@ -2360,40 +3436,65 @@ const UnifiedVisualEffectsManager = () => {
     }
     smokeParticles.current = activeSmoke;
 
-    if (smokeMeshRef.current) {
-      const count = smokeParticles.current.length;
-      smokeMeshRef.current.count = count;
-      for (let i = 0; i < count; i++) {
+    let fireCount = 0;
+    let smokeCount = 0;
+
+    if (fireMeshRef.current && smokeMeshRef.current) {
+      const totalCount = smokeParticles.current.length;
+      
+      for (let i = 0; i < totalCount; i++) {
         const p = smokeParticles.current[i];
         dummyObj.position.copy(p.pos);
+        
         const pct = p.age / p.maxAge;
         const size = p.startSize + (p.targetSize - p.startSize) * pct;
         dummyObj.scale.set(size, size, size);
-        dummyObj.rotation.set(p.rot * 0.25, p.rot, p.rot * 0.45);
+        
+        // Perfect CPU Billboarding: Align planes facing the active camera!
+        dummyObj.quaternion.copy(state.camera.quaternion);
+        // Spin billboard locally for natural rolling cloud variance
+        dummyObj.rotateZ(p.rot);
+        
         dummyObj.updateMatrix();
-        smokeMeshRef.current.setMatrixAt(i, dummyObj.matrix);
-
-        // color shifting
-        let r = 0.25, g = 0.25, b = 0.25;
-        let intensity = 1.0;
-        if (p.isFire) {
-          if (pct < 0.25) {
-            r = 1.0; g = 0.95; b = 0.6; intensity = 3.2;
-          } else if (pct < 0.55) {
-            r = 1.0; g = 0.38; b = 0.02; intensity = 2.0;
-          } else {
-            r = 0.15; g = 0.15; b = 0.15; intensity = 0.55;
-          }
-        } else {
-          const shade = 0.15 + 0.15 * (1.0 - pct);
-          r = shade; g = shade; b = shade; intensity = 0.75;
-        }
 
         const fade = Math.max(0, 1 - pct);
-        const col = new THREE.Color(r, g, b).multiplyScalar(intensity * fade);
-        smokeMeshRef.current.setColorAt(i, col);
+
+        if (p.isFire) {
+          fireMeshRef.current.setMatrixAt(fireCount, dummyObj.matrix);
+          
+          // Temperature-based fire color gradient (White core -> Hot Orange -> Dark Red Ash)
+          let r = 1.0, g = 0.5, b = 0.1;
+          let intensity = 3.0;
+          if (pct < 0.22) {
+            r = 1.0; g = 0.95; b = 0.65; intensity = 5.0;
+          } else if (pct < 0.52) {
+            r = 1.0; g = 0.42; b = 0.04; intensity = 3.0;
+          } else {
+            r = 0.8; g = 0.15; b = 0.0; intensity = 1.2;
+          }
+          
+          const col = new THREE.Color(r, g, b).multiplyScalar(intensity * fade);
+          fireMeshRef.current.setColorAt(fireCount, col);
+          fireCount++;
+        } else {
+          smokeMeshRef.current.setMatrixAt(smokeCount, dummyObj.matrix);
+          
+          // Thick dark industrial soot / carbon ash
+          const shade = 0.12 + 0.18 * (1.0 - pct);
+          const col = new THREE.Color(shade, shade * 1.05, shade * 1.1).multiplyScalar(fade);
+          smokeMeshRef.current.setColorAt(smokeCount, col);
+          smokeCount++;
+        }
       }
-      if (count > 0) {
+
+      fireMeshRef.current.count = fireCount;
+      smokeMeshRef.current.count = smokeCount;
+
+      if (fireCount > 0) {
+        fireMeshRef.current.instanceMatrix.needsUpdate = true;
+        if (fireMeshRef.current.instanceColor) fireMeshRef.current.instanceColor.needsUpdate = true;
+      }
+      if (smokeCount > 0) {
         smokeMeshRef.current.instanceMatrix.needsUpdate = true;
         if (smokeMeshRef.current.instanceColor) smokeMeshRef.current.instanceColor.needsUpdate = true;
       }
@@ -2412,20 +3513,34 @@ const UnifiedVisualEffectsManager = () => {
         />
       ))}
 
+      {/* Sparks instanced mesh: Dynamic high-velocity needle streaks */}
       <instancedMesh ref={sparksMeshRef} args={[undefined, undefined, 400]}>
         <boxGeometry args={[1, 1, 1]} />
-        <meshBasicMaterial toneMapped={false} blending={THREE.AdditiveBlending} transparent opacity={0.9} />
+        <meshBasicMaterial toneMapped={false} blending={THREE.AdditiveBlending} transparent opacity={0.95} />
       </instancedMesh>
 
+      {/* Volumetric smoke soot: soft blending */}
       <instancedMesh ref={smokeMeshRef} args={[undefined, undefined, 200]}>
-        <dodecahedronGeometry args={[1, 0]} />
-        <meshStandardMaterial 
+        <planeGeometry args={[1, 1]} />
+        <meshBasicMaterial 
+          map={softParticleTexture}
           toneMapped={false} 
-          roughness={0.95} 
-          metalness={0.02} 
           transparent 
-          opacity={0.35} 
+          depthWrite={false}
           blending={THREE.NormalBlending}
+          opacity={0.5}
+        />
+      </instancedMesh>
+
+      {/* Luminous fireballs: additive HDR glow */}
+      <instancedMesh ref={fireMeshRef} args={[undefined, undefined, 200]}>
+        <planeGeometry args={[1, 1]} />
+        <meshBasicMaterial 
+          map={softParticleTexture}
+          toneMapped={false} 
+          transparent 
+          depthWrite={false}
+          blending={THREE.AdditiveBlending}
         />
       </instancedMesh>
     </>
@@ -2528,10 +3643,39 @@ const MovingSpotlights = () => {
 
 const DebrisSystem = () => {
   const debrisList = useGameStore(s => s.debris);
+  const fragments = useGameStore(s => s.fragments);
   const settings = useGameStore(s => s.settings);
 
   return (
     <group>
+      {fragments.map((frag) => {
+        const partDef = PART_TEMPLATES.find(p => p.templateId === frag.definitionId);
+        if (!partDef) return null;
+        const [w, h, d] = partDef.size || [0.5, 0.5, 0.5];
+        return (
+          <RigidBody ccd={true}
+            key={frag.id}
+            position={frag.position}
+            quaternion={frag.rotation}
+            linearVelocity={frag.velocity}
+            angularVelocity={frag.angularVelocity}
+            colliders={partDef.visualKind === 'capsule' ? 'hull' : partDef.visualKind === 'cylinder' ? 'hull' : 'cuboid'}
+            mass={partDef.mass || 1.0}
+            type="dynamic"
+          >
+            <mesh castShadow receiveShadow>
+              {partDef.visualKind === 'box' && <boxGeometry args={[w, h, d]} />}
+              {partDef.visualKind === 'wedge' && <boxGeometry args={[w, h, d]} />}
+              {partDef.visualKind === 'cylinder' && <cylinderGeometry args={[w, w, d, 24]} />}
+              {partDef.visualKind === 'capsule' && <capsuleGeometry args={[h/2, Math.max(0.01, w - h), 16, 16]} />}
+              {(!partDef.visualKind || partDef.visualKind === 'slope') && <boxGeometry args={[w, h, d]} />}
+              
+              <meshStandardMaterial color={frag.color} metalness={0.7} roughness={0.3} />
+            </mesh>
+          </RigidBody>
+        );
+      })}
+      
       {debrisList.map((d) => (
         <RigidBody ccd={true} 
           key={d.id} 
@@ -2639,6 +3783,44 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
   const settings = useGameStore(s => s.settings);
   const [debugPhysics, setDebugPhysics] = useState(false);
 
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [diagnosticsTab, setDiagnosticsTab] = useState<'player' | 'opponent'>('player');
+  const [playerMechData, setPlayerMechData] = useState<CombatMechanicalState | null>(null);
+  const [opponentMechData, setOpponentMechData] = useState<CombatMechanicalState | null>(null);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (globalMechanicalState.player.current) {
+        const p = globalMechanicalState.player.current;
+        setPlayerMechData({
+          ...p,
+          nodes: p.nodes.map(n => ({ ...n, capability: { ...n.capability } })),
+          edges: p.edges.map(e => ({ ...e })),
+          wheels: p.wheels.map(w => ({ ...w })),
+          weapons: p.weapons.map(w => ({ ...w })),
+          eventLedger: [...p.eventLedger]
+        });
+      } else {
+        setPlayerMechData(null);
+      }
+      if (globalMechanicalState.opponent.current) {
+        const o = globalMechanicalState.opponent.current;
+        setOpponentMechData({
+          ...o,
+          nodes: o.nodes.map(n => ({ ...n, capability: { ...n.capability } })),
+          edges: o.edges.map(e => ({ ...e })),
+          wheels: o.wheels.map(w => ({ ...w })),
+          weapons: o.weapons.map(w => ({ ...w })),
+          eventLedger: [...o.eventLedger]
+        });
+      } else {
+        setOpponentMechData(null);
+      }
+    }, 150);
+
+    return () => clearInterval(timer);
+  }, []);
+
   useEffect(() => {
     if (battleStatus === 'battle' && wrapperRef.current) {
       wrapperRef.current.focus();
@@ -2727,30 +3909,30 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
         {/* Futuristic Glowing Neon Perimeter Wall Tubes */}
         <group position={[0, 2.4, 0]}>
           {/* Cyan/Blue back light tube */}
-          <mesh position={[0, 0, -15.02]}>
-            <boxGeometry args={[30.1, 0.08, 0.08]} />
+          <mesh position={[0, 0, -15.02]} rotation={[0, 0, Math.PI / 2]}>
+            <cylinderGeometry args={[0.04, 0.04, 30.1, 8]} />
             <meshBasicMaterial color="#00E5FF" toneMapped={false} />
           </mesh>
           {/* Orange front light tube */}
-          <mesh position={[0, 0, 15.02]}>
-            <boxGeometry args={[30.1, 0.08, 0.08]} />
+          <mesh position={[0, 0, 15.02]} rotation={[0, 0, Math.PI / 2]}>
+            <cylinderGeometry args={[0.04, 0.04, 30.1, 8]} />
             <meshBasicMaterial color="#FF5500" toneMapped={false} />
           </mesh>
           {/* Cyan/Blue left light tube */}
-          <mesh position={[-15.02, 0, 0]}>
-            <boxGeometry args={[0.08, 0.08, 30.1]} />
+          <mesh position={[-15.02, 0, 0]} rotation={[Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[0.04, 0.04, 30.1, 8]} />
             <meshBasicMaterial color="#00E5FF" toneMapped={false} />
           </mesh>
           {/* Orange right light tube */}
-          <mesh position={[15.02, 0, 0]}>
-            <boxGeometry args={[0.08, 0.08, 30.1]} />
+          <mesh position={[15.02, 0, 0]} rotation={[Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[0.04, 0.04, 30.1, 8]} />
             <meshBasicMaterial color="#FF5500" toneMapped={false} />
           </mesh>
         </group>
         
         <ContactShadows position={[0, 0.02, 0]} opacity={0.6} scale={50} blur={2.5} far={5} />
-
-        <Physics timeStep={1 / 60} interpolate updatePriority={-1} debug={debugPhysics} gravity={[0, -29.43, 0]}>
+        
+        <Physics timeStep={settings.physicsTimeStep || 1 / 120} interpolate updatePriority={-1} debug={debugPhysics} gravity={[0, -29.43, 0]}>
           <EffectsManager />
           <DebrisSystem />
           <UnifiedVisualEffectsManager />
@@ -2764,34 +3946,30 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
           {/* Arena Walls */}
           <RigidBody ccd={true} type="fixed" userData={{ role: 'arenaWall', material: 'arenaWall', hitZone: 'arenaWall' }}>
             <CuboidCollider args={[15, 2.5, 0.5]} position={[0, 1.25, -15.5]} friction={0.9} restitution={0.12} />
-            <mesh position={[0, 1.25, -15.5]} receiveShadow castShadow>
-              <boxGeometry args={[30, 2.5, 1]} />
-              <meshStandardMaterial color="#2d2d2d" roughness={0.9} />
-            </mesh>
+            <group position={[0, 1.25, -15.5]}>
+              <RoundedBoxMesh size={[30, 2.5, 1]} color="#2d2d2d" />
+            </group>
             
             <CuboidCollider args={[15, 2.5, 0.5]} position={[0, 1.25, 15.5]} friction={0.9} restitution={0.12} />
-            <mesh position={[0, 1.25, 15.5]} receiveShadow castShadow>
-              <boxGeometry args={[30, 2.5, 1]} />
-              <meshStandardMaterial color="#2d2d2d" roughness={0.9} />
-            </mesh>
+            <group position={[0, 1.25, 15.5]}>
+              <RoundedBoxMesh size={[30, 2.5, 1]} color="#2d2d2d" />
+            </group>
             
             <CuboidCollider args={[0.5, 2.5, 15]} position={[-15.5, 1.25, 0]} friction={0.9} restitution={0.12} />
-            <mesh position={[-15.5, 1.25, 0]} receiveShadow castShadow>
-              <boxGeometry args={[1, 2.5, 30]} />
-              <meshStandardMaterial color="#2d2d2d" roughness={0.9} />
-            </mesh>
+            <group position={[-15.5, 1.25, 0]}>
+              <RoundedBoxMesh size={[1, 2.5, 30]} color="#2d2d2d" />
+            </group>
             
             <CuboidCollider args={[0.5, 2.5, 15]} position={[15.5, 1.25, 0]} friction={0.9} restitution={0.12} />
-            <mesh position={[15.5, 1.25, 0]} receiveShadow castShadow>
-              <boxGeometry args={[1, 2.5, 30]} />
-              <meshStandardMaterial color="#2d2d2d" roughness={0.9} />
-            </mesh>
+            <group position={[15.5, 1.25, 0]}>
+              <RoundedBoxMesh size={[1, 2.5, 30]} color="#2d2d2d" />
+            </group>
           </RigidBody>
 
           {/* Interactive Bots */}
           <Bot 
             key={matchCount + '-player'}
-            position={[0, 0.5, 6]} 
+            position={[0, 2.0, 6]} 
             color="#444" 
             isSpinning={activeWeapon} 
             isPlayer={true} 
@@ -2800,7 +3978,7 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
           />
           <Bot 
             key={matchCount + '-opponent'}
-            position={[0, 0.5, -6]} 
+            position={[0, 2.0, -6]} 
             color="#555" 
             isSpinning={battleStatus === 'battle'} 
             isPlayer={false} 
@@ -2823,6 +4001,283 @@ export const Arena3D = ({ activeWeapon }: { activeWeapon: boolean }) => {
 
         <Environment preset="studio" />
       </Canvas>
+
+      {/* Collapsible Diagnostics Trigger Button */}
+      <div className="absolute top-[85px] right-4 z-40">
+        <button
+          id="btn-diagnostics-toggle"
+          onClick={() => setShowDiagnostics(!showDiagnostics)}
+          className={`px-3 py-2 text-xs font-mono font-medium rounded-lg border flex items-center gap-2 transition-all duration-300 shadow-lg ${
+            showDiagnostics 
+              ? 'bg-red-950/40 border-red-500/50 text-red-400 hover:bg-red-900/40' 
+              : 'bg-cyan-950/40 border-cyan-500/50 text-cyan-400 hover:bg-cyan-900/40'
+          }`}
+        >
+          <span className={`w-2 h-2 rounded-full ${showDiagnostics ? 'bg-red-500 animate-pulse' : 'bg-cyan-400 animate-pulse'}`} />
+          {showDiagnostics ? 'CLOSE DIAGNOSTICS' : 'MECHANICAL DIAGNOSTICS'}
+        </button>
+      </div>
+
+      {showDiagnostics && (
+        <div id="diagnostics-panel-hud" className="absolute top-[135px] right-4 bottom-4 w-[380px] z-30 flex flex-col gap-3 bg-[#0d0e12]/90 backdrop-blur-md border border-[#ffffff]/10 border-cyan-500/20 rounded-xl p-4 overflow-y-auto select-none pointer-events-auto text-[#e2e8f0]">
+          {/* Header */}
+          <div className="flex items-center justify-between border-b border-gray-800 pb-2">
+            <span className="text-xs font-mono font-bold tracking-wider text-cyan-400">COMBAT FORENSICS & STRUCTURAL PATHS</span>
+            <span className="text-[10px] font-mono text-gray-500">REALTIME</span>
+          </div>
+
+          {/* Selector Tabs */}
+          <div className="flex gap-2 bg-black/40 p-1 rounded-lg border border-gray-800">
+            <button
+              id="tab-diagnostics-player"
+              onClick={() => setDiagnosticsTab('player')}
+              className={`flex-1 py-1 text-[10px] font-mono font-medium rounded transition-all ${
+                diagnosticsTab === 'player' 
+                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30' 
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              PLAYER BOT
+            </button>
+            <button
+              id="tab-diagnostics-opponent"
+              onClick={() => setDiagnosticsTab('opponent')}
+              className={`flex-1 py-1 text-[10px] font-mono font-medium rounded transition-all ${
+                diagnosticsTab === 'opponent' 
+                  ? 'bg-red-500/20 text-red-300 border border-red-500/30' 
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              OPPONENT BOT
+            </button>
+          </div>
+
+          {/* Selected Bot Mech State Display */}
+          {(() => {
+            const data = diagnosticsTab === 'player' ? playerMechData : opponentMechData;
+            if (!data) {
+              return (
+                <div className="flex-1 flex flex-col items-center justify-center text-center p-8 border border-dashed border-gray-800 rounded-lg">
+                  <span className="text-xs font-mono text-gray-500">NO ADVANCED MECHANICAL DATA</span>
+                  <span className="text-[9px] font-mono text-gray-600 mt-1 max-w-[200px]">
+                    Requires spawning a Custom Design with custom assemblies in the Workshop first!
+                  </span>
+                </div>
+              );
+            }
+
+            const totalNodes = data.nodes.length;
+            const overallTractionMultiplier = totalNodes > 0 
+              ? data.nodes.reduce((acc, n) => acc + n.capability.structuralMultiplier, 0) / totalNodes
+              : 1.0;
+            const overallWeaponMultiplier = totalNodes > 0 
+              ? data.nodes.reduce((acc, n) => acc + n.capability.actuatorEfficiency, 0) / totalNodes
+              : 1.0;
+            const overallMobilityMultiplier = totalNodes > 0 
+              ? data.nodes.reduce((acc, n) => acc + n.capability.alignmentQuality, 0) / totalNodes
+              : 1.0;
+            const totalFailures = data.nodes.filter(n => n.failureState === 'failed' || n.failureState === 'detached').length;
+
+            return (
+              <div className="flex flex-col gap-4 flex-1">
+                {/* 1. Overall capability multipliers */}
+                <div className="bg-black/25 p-2 rounded-lg border border-gray-800/40">
+                  <div className="text-[10px] font-mono font-semibold text-gray-400 mb-1">CAPABILITY DEGRADATION</div>
+                  <div className="grid grid-cols-2 gap-2 font-mono text-[10px]">
+                    <div className="flex justify-between items-center bg-black/10 p-1.5 rounded">
+                      <span className="text-gray-500">Traction Capacity:</span>
+                      <span className={overallTractionMultiplier < 0.8 ? 'text-amber-400 font-bold' : 'text-cyan-400'}>
+                        {(overallTractionMultiplier * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <div className="flex justify-between items-center bg-black/10 p-1.5 rounded">
+                      <span className="text-gray-500">Weapon Output:</span>
+                      <span className={overallWeaponMultiplier < 0.8 ? 'text-amber-400 font-bold' : 'text-cyan-400'}>
+                        {(overallWeaponMultiplier * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <div className="flex justify-between items-center bg-black/10 p-1.5 rounded">
+                      <span className="text-gray-500">Mobility Efficiency:</span>
+                      <span className={overallMobilityMultiplier < 0.8 ? 'text-amber-400 font-bold' : 'text-cyan-400'}>
+                        {(overallMobilityMultiplier * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <div className="flex justify-between items-center bg-black/10 p-1.5 rounded">
+                      <span className="text-gray-500">Failures Logged:</span>
+                      <span className="text-gray-400 font-bold">{totalFailures}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 2. Joints & Demand ratios */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="text-[10px] font-mono font-semibold text-cyan-400/80 uppercase">Structural Joints & Load Paths</div>
+                  <div className="flex flex-col gap-2 max-h-[140px] overflow-y-auto pr-1">
+                    {data.edges.map((edge) => {
+                      const ratio = edge.demandRatio;
+                      const pct = Math.min(100, ratio * 100);
+                      const barColor = edge.state === 'failed' 
+                        ? 'bg-red-600' 
+                        : edge.state === 'yielded' 
+                        ? 'bg-amber-500 animate-pulse' 
+                        : 'bg-cyan-500';
+
+                      return (
+                        <div key={edge.jointId} className="bg-black/30 p-1.5 rounded border border-gray-800/40 text-[9px] font-mono">
+                          <div className="flex justify-between items-center mb-1">
+                            <span className="font-bold text-gray-300">{edge.jointId.replace(/_/g, ' ')}</span>
+                            <span className={`px-1 rounded-sm text-[8px] ${
+                              edge.state === 'failed' ? 'bg-red-950 text-red-400 border border-red-500/20' :
+                              edge.state === 'yielded' ? 'bg-amber-950 text-amber-400 border border-amber-500/20' :
+                              'bg-cyan-950 text-cyan-400 border border-cyan-500/20'
+                            }`}>
+                              {edge.state.toUpperCase()}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <div className="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                              <div className={`h-full ${barColor}`} style={{ width: `${pct}%` }} />
+                            </div>
+                            <span className="text-[8px] text-gray-400 text-right min-w-[32px] font-bold">
+                              {ratio.toFixed(2)}x
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 3. Slip rates */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="text-[10px] font-mono font-semibold text-cyan-400/80 uppercase">Wheel Slip & Contacts</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {data.wheels.map((w, idx) => {
+                      const isLeft = idx % 2 === 0;
+                      const contact = data.supportContacts.find(sc => sc.partInstanceId === w.partInstanceId);
+                      const normalLoad = contact ? contact.normalLoad : 0;
+                      const longitudinalSlip = contact ? contact.longitudinalSlip : 0;
+                      const lateralSlip = contact ? contact.lateralSlip : 0;
+
+                      const condition = w.detached 
+                        ? 'detached' 
+                        : w.seized 
+                        ? 'seized' 
+                        : (Math.abs(longitudinalSlip) > 0.25 || Math.abs(lateralSlip) > 0.25) 
+                        ? 'sliding' 
+                        : 'nominal';
+
+                      return (
+                        <div key={w.partInstanceId + idx} className="bg-black/30 p-1.5 rounded border border-gray-800/30 text-[9px] font-mono flex flex-col gap-1">
+                          <div className="flex justify-between items-center">
+                            <span className="font-bold text-gray-400">{isLeft ? 'LEFT WHEEL' : 'RIGHT WHEEL'}</span>
+                            <span className={`text-[8px] font-bold ${
+                              condition === 'detached' ? 'text-red-500' :
+                              condition === 'seized' ? 'text-red-400' :
+                              condition === 'sliding' ? 'text-amber-400 animate-pulse' :
+                              'text-emerald-400'
+                            }`}>
+                              {condition.toUpperCase()}
+                            </span>
+                          </div>
+                          <div className="text-[8px] text-gray-500 flex flex-col gap-0.5">
+                            <div className="flex justify-between">
+                              <span>Load:</span>
+                              <span className="text-gray-300">{(normalLoad).toFixed(0)} N</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span>Long Slip:</span>
+                              <span className="text-gray-300">{(longitudinalSlip * 100).toFixed(1)}%</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span>Lat Slip:</span>
+                              <span className="text-gray-300">{(lateralSlip * 100).toFixed(1)}%</span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 4. Weapons */}
+                {data.weapons.length > 0 && (
+                  <div className="flex flex-col gap-1.5">
+                    <div className="text-[10px] font-mono font-semibold text-cyan-400/80 uppercase">Weapon Actuator telemetry</div>
+                    {data.weapons.map((w) => {
+                      const condition = w.detached ? 'detached' : w.jammed ? 'jammed' : w.seized ? 'seized' : 'nominal';
+                      return (
+                        <div key={w.partInstanceId} className="bg-black/30 p-2 rounded border border-gray-800/30 text-[9px] font-mono flex justify-between items-center">
+                          <div className="flex flex-col">
+                            <span className="font-bold text-gray-300">ACTUATOR OUTPUT</span>
+                            <span className="text-[8px] text-gray-500">AngVel: {w.angularVelocity.toFixed(1)} rad/s</span>
+                          </div>
+                          <div className="text-right flex flex-col">
+                            <span className="font-bold text-cyan-400">{(w.storedKineticEnergy).toFixed(1)} J</span>
+                            <span className={`text-[8px] font-bold ${condition === 'detached' ? 'text-red-500' : condition === 'jammed' ? 'text-amber-500' : 'text-emerald-400'}`}>
+                              {condition.toUpperCase()}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* 5. Causal Ledger list */}
+                <div className="flex flex-col gap-1.5 flex-1 min-h-[120px]">
+                  <div className="text-[10px] font-mono font-semibold text-cyan-400/80 uppercase">Causal Ledger (Combat Forensics)</div>
+                  <div className="bg-black/50 p-2 border border-gray-800/60 rounded-lg flex-1 overflow-y-auto max-h-[160px] font-mono text-[9px] text-[#00E5FF] flex flex-col gap-1 select-text">
+                    {data.eventLedger.length === 0 ? (
+                      <span className="text-gray-600 italic">No forensic events logged yet...</span>
+                    ) : (
+                      data.eventLedger.map((evt, idx) => {
+                        const tick = evt.tick;
+                        let description = '';
+                        switch (evt.type) {
+                          case 'impact':
+                            description = `Part ${evt.partInstanceId.substring(0, 8)}: Received impact of ${evt.energy.toFixed(1)}J (impulse: ${evt.impulse.toFixed(1)} Ns)`;
+                            break;
+                          case 'yielded':
+                            description = `Joint ${evt.jointId.replace(/_/g, ' ')}: Yielded under stress! (Demand: ${evt.demandRatio.toFixed(2)}x) ${evt.msg}`;
+                            break;
+                          case 'degradation':
+                            description = `Part ${evt.partInstanceId.substring(0, 8)}: ${evt.capabilityType} degraded by ${evt.change}`;
+                            break;
+                          case 'jammed':
+                            description = `Weapon actuator ${evt.partInstanceId.substring(0, 8)} jammed!`;
+                            break;
+                          case 'joint_failed':
+                            description = `Joint ${evt.jointId.replace(/_/g, ' ')} completely failed & severed!`;
+                            break;
+                          case 'detached':
+                            description = `Part ${evt.partInstanceId.substring(0, 8)} completely detached and lost!`;
+                            break;
+                          case 'knockout':
+                            description = `Bot knocked out: ${evt.reason}`;
+                            break;
+                          default:
+                            description = `Unknown combat event`;
+                        }
+
+                        return (
+                          <div key={idx} className="border-b border-gray-900 pb-1 flex flex-col gap-0.5">
+                            <div className="flex justify-between text-[8px] text-gray-500">
+                              <span>TICK: {tick}</span>
+                              <span>{evt.type.toUpperCase()}</span>
+                            </div>
+                            <span className="text-gray-300 break-words">{description}</span>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      )}
     </div>
   );
 };

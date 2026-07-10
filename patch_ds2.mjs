@@ -1,10 +1,10 @@
-import { ImpactEvent, DamageableComponent, DamageTuning, Materials } from './DamageTypes';
+import fs from 'fs';
+let code = `import { ImpactEvent, DamageableComponent, DamageTuning, Materials } from './DamageTypes';
 
 export class DamageSystem {
   private static eventPool: ImpactEvent[] = [];
   private static poolSize = 100;
   private static seqCounter = 0;
-  public static materialRequests: any[] = [];
   
   static initialize() {
     for (let i = 0; i < this.poolSize; i++) {
@@ -252,3 +252,6 @@ export class DamageSystem {
 }
 
 DamageSystem.initialize();
+`;
+
+fs.writeFileSync('src/combat/DamageSystem.ts', code);

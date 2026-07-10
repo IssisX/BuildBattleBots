@@ -132,7 +132,7 @@ export const HUD = ({ botState }: { botState: BotState }) => {
                     <span className="font-mono text-[8px] text-white/40">CHASSIS_MONITOR</span>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
-                    {['front', 'rear', 'left', 'right'].map((zone) => {
+                    {['front', 'rear', 'left', 'right', 'top', 'core'].map((zone) => {
                       const comp = playerDamageComponents[zone];
                       if (!comp) return null;
                       const integrityPct = Math.max(0, Math.round(comp.mountIntegrity * 100));
@@ -183,7 +183,7 @@ export const HUD = ({ botState }: { botState: BotState }) => {
                     <span className="font-mono text-[8px] text-white/40">SCAN_MONITOR</span>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
-                    {['front', 'rear', 'left', 'right'].map((zone) => {
+                    {['front', 'rear', 'left', 'right', 'top', 'core'].map((zone) => {
                       const comp = opponentDamageComponents[zone];
                       if (!comp) return null;
                       const integrityPct = Math.max(0, Math.round(comp.mountIntegrity * 100));

@@ -1,7 +1,7 @@
 import React from 'react';
 import { VehicleConfig, WeaponType, ArmorType } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
-import { Settings, Crosshair, ShieldAlert, Cpu, X, PaintBucket, Coins, Lock, Unlock, RotateCcw, Sliders, Wrench } from 'lucide-react';
+import { Settings, Crosshair, ShieldAlert, Cpu, X, PaintBucket, Coins, Lock, Unlock, RotateCcw, Sliders, Wrench, Volume2, Eye, Zap } from 'lucide-react';
 import { useGameStore } from '../store';
 import { cn } from '../lib/utils';
 
@@ -459,6 +459,123 @@ export const ConfigurationPanel = ({
                     </div>
                   </div>
 
+                  {/* AUDIO SYNTHESIS ENGINE */}
+                  <div className="bg-[#1a1a1a] border border-[#333] rounded-sm p-4">
+                    <div className="flex items-center gap-3 mb-4 border-b border-[#333] pb-3">
+                      <div className="p-1.5 bg-[#333] rounded-sm">
+                        <Volume2 className="text-[#E040FB]" size={16} />
+                      </div>
+                      <h3 className="font-mono text-xs font-bold uppercase tracking-widest text-white">Audio Synthesis</h3>
+                    </div>
+                    <div className="space-y-4">
+                      {/* Sound FX Volume */}
+                      <div>
+                        <div className="flex justify-between font-mono text-[10px] text-white/40 uppercase mb-1">
+                          <span>SFX & Combat Volume</span>
+                          <span className="text-white font-bold">{Math.round((settings.soundVolume ?? 0.8) * 100)}%</span>
+                        </div>
+                        <input type="range" min="0" max="1" step="0.05" value={settings.soundVolume ?? 0.8} onChange={(e) => updateSetting('soundVolume', parseFloat(e.target.value))} className="w-full accent-[#E040FB]" />
+                      </div>
+                      {/* Ambient Drone/Music Volume */}
+                      <div>
+                        <div className="flex justify-between font-mono text-[10px] text-white/40 uppercase mb-1">
+                          <span>Ambient Drone / Music</span>
+                          <span className="text-white font-bold">{Math.round((settings.musicVolume ?? 0.5) * 100)}%</span>
+                        </div>
+                        <input type="range" min="0" max="1" step="0.05" value={settings.musicVolume ?? 0.5} onChange={(e) => updateSetting('musicVolume', parseFloat(e.target.value))} className="w-full accent-[#E040FB]" />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* ADVANCED GRAPHICS & LOD */}
+                  <div className="bg-[#1a1a1a] border border-[#333] rounded-sm p-4">
+                    <div className="flex items-center gap-3 mb-4 border-b border-[#333] pb-3">
+                      <div className="p-1.5 bg-[#333] rounded-sm">
+                        <Eye className="text-[#00E676]" size={16} />
+                      </div>
+                      <h3 className="font-mono text-xs font-bold uppercase tracking-widest text-white">Graphics & LOD</h3>
+                    </div>
+                    <div className="space-y-4">
+                      {/* Graphics Detail */}
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono text-[10px] text-white/80 uppercase">Graphics Detail</span>
+                        <select value={settings.graphicsDetail || "high"} onChange={(e) => updateSetting('graphicsDetail', e.target.value as any)} className="bg-[#222] border border-[#333] text-white text-[10px] font-mono px-2 py-1 outline-none">
+                          <option value="low">Low</option>
+                          <option value="medium">Medium</option>
+                          <option value="high">High</option>
+                          <option value="ultra">Ultra (4K Shadows)</option>
+                        </select>
+                      </div>
+                      {/* Level of Detail (LOD) Scale */}
+                      <div>
+                        <div className="flex justify-between font-mono text-[10px] text-white/40 uppercase mb-1">
+                          <span>Mesh LOD Scale (Quality)</span>
+                          <span className="text-white font-bold">{(settings.lodScale ?? 1.0).toFixed(1)}x</span>
+                        </div>
+                        <input type="range" min="0.5" max="2.0" step="0.1" value={settings.lodScale ?? 1.0} onChange={(e) => updateSetting('lodScale', parseFloat(e.target.value))} className="w-full accent-[#00E676]" />
+                        <span className="text-[9px] font-mono text-white/30 block mt-1 leading-normal">
+                          Adjusts the tessellation frequency and distance thresholds of the robot mesh geometry.
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* HIGH-IMPACT PHYSICS SOLVER */}
+                  <div className="bg-[#1a1a1a] border border-[#333] rounded-sm p-4">
+                    <div className="flex items-center gap-3 mb-4 border-b border-[#333] pb-3">
+                      <div className="p-1.5 bg-[#333] rounded-sm">
+                        <Zap className="text-[#FFEA00]" size={16} />
+                      </div>
+                      <h3 className="font-mono text-xs font-bold uppercase tracking-widest text-white">High-Impact Physics</h3>
+                    </div>
+                    <div className="space-y-4">
+                      {/* Physics TimeStep */}
+                      <div>
+                        <div className="flex justify-between font-mono text-[10px] text-white/40 uppercase mb-1">
+                          <span>Solver Frequency</span>
+                          <span className="text-white font-bold">{settings.physicsTimeStep ? `${Math.round(1 / settings.physicsTimeStep)} Hz` : "120 Hz"}</span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2 mt-2">
+                          {[
+                            { label: "60 Hz", val: 1 / 60, desc: "Standard" },
+                            { label: "120 Hz", val: 1 / 120, desc: "Pro Precision" },
+                            { label: "240 Hz", val: 1 / 240, desc: "Extreme (No Clip)" }
+                          ].map(opt => (
+                            <button
+                              key={opt.label}
+                              type="button"
+                              onClick={() => updateSetting('physicsTimeStep', opt.val)}
+                              className={cn(
+                                "py-2 px-1 border font-mono text-[9px] font-bold flex flex-col items-center rounded-sm transition-all",
+                                Math.abs((settings.physicsTimeStep || (1/120)) - opt.val) < 0.0001
+                                  ? "bg-[#FFEA00]/10 border-[#FFEA00] text-[#FFEA00]"
+                                  : "bg-[#222] border-[#333] text-white/50 hover:bg-[#252525]"
+                              )}
+                            >
+                              <span>{opt.label}</span>
+                              <span className="text-[7px] text-white/30 font-normal mt-0.5">{opt.desc}</span>
+                            </button>
+                          ))}
+                        </div>
+                        <span className="text-[9px] font-mono text-white/30 block mt-2 leading-normal">
+                          Decreasing solver step duration ensures high-velocity spinning blades collide accurately without clipping or phasing through armor.
+                        </span>
+                      </div>
+
+                      {/* Physics Substeps */}
+                      <div>
+                        <div className="flex justify-between font-mono text-[10px] text-white/40 uppercase mb-1">
+                          <span>Contact Iterations</span>
+                          <span className="text-white font-bold">{settings.physicsSubsteps ?? 4}x</span>
+                        </div>
+                        <input type="range" min="1" max="10" step="1" value={settings.physicsSubsteps ?? 4} onChange={(e) => updateSetting('physicsSubsteps', parseInt(e.target.value))} className="w-full accent-[#FFEA00]" />
+                        <span className="text-[9px] font-mono text-white/30 block mt-1 leading-normal">
+                          Runs multiple solver passes per frame to fully resolve multi-contact interpenetration, rigid body friction, and micro-bounce mechanics.
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
                   {/* PERFORMANCE SAFETY */}
                   <div className="bg-[#1a1a1a] border border-[#333] rounded-sm p-4">
                     <div className="flex items-center gap-3 mb-4 border-b border-[#333] pb-3">
@@ -499,6 +616,7 @@ export const ConfigurationPanel = ({
                           <option value="low">Low</option>
                           <option value="medium">Medium</option>
                           <option value="high">High</option>
+                          <option value="ultra">Ultra</option>
                         </select>
                       </div>
                       {/* Performance Mode */}

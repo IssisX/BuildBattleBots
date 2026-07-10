@@ -311,6 +311,12 @@ const playNoiseBurst = (time: number, outNode: AudioNode, volume: number, durati
   noise.start(time);
 };
 
+export const updateAudioVolume = (val: number) => {
+  if (masterGain) {
+    masterGain.gain.setValueAtTime(val * 0.8, audioCtx ? audioCtx.currentTime : 0);
+  }
+};
+
 export const resumeAudio = () => {
   if (audioCtx && audioCtx.state === 'suspended') {
     audioCtx.resume();

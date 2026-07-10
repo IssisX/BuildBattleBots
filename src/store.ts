@@ -1,8 +1,10 @@
 import { create } from 'zustand';
 import { DamageableComponent, ImpactEvent } from './combat/DamageTypes';
 import { DamageSystem } from './combat/DamageSystem';
+import { generateAutoBot, AutoBuildArchetype } from './lib/auto-builder';
 import { db, auth } from './lib/firebase.ts';
 import { doc, getDoc, setDoc, collection, getDocs, deleteDoc, serverTimestamp, writeBatch } from 'firebase/firestore';
+import { updateAudioVolume } from './lib/audio';
 
 enum OperationType {
   CREATE = 'create',
@@ -30,7 +32,7 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 
 import { CustomBotConfig, BotPhysicsSummary } from './types';
 import { validateCustomBot, computePhysicsSummary } from './lib/validation';
-import { resolvePartTransformsV2 } from './lib/partsCatalog';
+import { resolvePartTransformsV2, PART_TEMPLATES } from './lib/partsCatalog';
 
 export const getInitialCustomBotConfig = (): CustomBotConfig => {
   try {
@@ -64,12 +66,50 @@ export const compileCustomBotStatsV2 = (config: CustomBotConfig): VehicleConfig 
   const resolved = resolvePartTransformsV2(config.parts, config.rootPartId);
   const physics = computePhysicsSummary(config, resolved);
 
+  // Dynamically analyze the parts list to find weapons, armor, etc.
+  let maxWeaponDamage = 0;
+  let primaryWeaponType: WeaponType = 'spinner';
+  let totalArmor = 0;
+  let partCount = config.parts.length;
+  let wheelCount = 0;
+
+  config.parts.forEach(p => {
+    const partDef = PART_TEMPLATES.find(t => t.templateId === p.definitionId);
+    if (!partDef) return;
+    
+    totalArmor += partDef.armor || 80;
+    if (partDef.type === 'weapon') {
+      const pDmg = partDef.damage || 50;
+      if (pDmg > maxWeaponDamage) {
+        maxWeaponDamage = pDmg;
+        if (partDef.templateId.includes('spinner')) primaryWeaponType = 'spinner';
+        else if (partDef.templateId.includes('flipper')) primaryWeaponType = 'flipper';
+        else if (partDef.templateId.includes('saw')) primaryWeaponType = 'saw';
+        else if (partDef.templateId.includes('hammer')) primaryWeaponType = 'hammer';
+        else if (partDef.templateId.includes('drum')) primaryWeaponType = 'drum';
+        else if (partDef.templateId.includes('crusher')) primaryWeaponType = 'crusher';
+        else if (partDef.templateId.includes('pickaxe')) primaryWeaponType = 'crusher';
+      }
+    }
+    if (partDef.type === 'wheel') {
+      wheelCount++;
+    }
+  });
+
+  const avgArmor = partCount > 0 ? totalArmor / partCount : 90;
+  const maxSpeed = Math.max(10, Math.min(35, 40 - (physics.totalMass * 0.1) + (wheelCount * 2)));
+  const torque = Math.max(200, Math.min(1000, 300 + (physics.totalMass * 3)));
+
   return {
     id: config.id,
     name: config.name,
-    weapon: { type: 'spinner', rpm: 5000, damage: 85 },
-    armor: { type: 'steel', integrity: 100, weight: physics.totalMass },
-    motor: { torque: 800, maxSpeed: 25 },
+    weapon: { 
+      type: primaryWeaponType, 
+      rpm: primaryWeaponType === 'spinner' || primaryWeaponType === 'saw' || primaryWeaponType === 'drum' ? 5000 : 1200, 
+      damage: maxWeaponDamage || 85 
+    },
+    armor: { type: 'steel', integrity: Math.round(avgArmor), weight: physics.totalMass },
+    motor: { torque, maxSpeed },
     isCustom: true,
     parts: config.parts as any, // So Arena3D recognizes it as custom
     customConfig: config,
@@ -237,6 +277,9 @@ interface GameState {
   
   debris: { id: string; position: [number, number, number]; velocity: [number, number, number]; timestamp: number }[];
   spawnDebris: (position: [number, number, number], amount: number, impactVector?: [number, number, number]) => void;
+  
+  fragments: { id: string; partId: string; definitionId: string; position: [number, number, number]; rotation: [number, number, number, number]; velocity: [number, number, number]; angularVelocity: [number, number, number]; color: string; botId: string; timestamp: number }[];
+  spawnFragment: (fragment: any) => void;
 
   sparks: { id: string; position: [number, number, number]; velocity: [number, number, number]; color: string; timestamp: number }[];
   cleanupEffects: () => void;
@@ -349,7 +392,19 @@ const DEFAULT_SETTINGS: GameSettings = {
   debrisLifetime: 5.0,
   effectLifetime: 2.0,
   fragmentQuality: "medium",
-  performanceMode: false
+  performanceMode: false,
+
+  // Sound Volume Tuning
+  soundVolume: 0.8,
+  musicVolume: 0.5,
+
+  // Visuals & Level of Detail (LOD)
+  graphicsDetail: "high",
+  lodScale: 1.0,
+
+  // High-Impact Physics Fidelity
+  physicsTimeStep: 1 / 120, // 120Hz physics frequency
+  physicsSubsteps: 4
 };
 
 function getValidatedSettings(): GameSettings {
@@ -385,14 +440,23 @@ function getValidatedSettings(): GameSettings {
     validateNum('debrisLifetime', 1.0, 15.0);
     validateNum('effectLifetime', 0.5, 5.0);
     
+    validateNum('soundVolume', 0.0, 1.0);
+    validateNum('musicVolume', 0.0, 1.0);
+    validateNum('lodScale', 0.5, 2.0);
+    validateNum('physicsTimeStep', 0.004, 0.033);
+    validateNum('physicsSubsteps', 1, 10);
+    
     if (typeof parsed.reducedMotion === 'boolean') {
       validated.reducedMotion = parsed.reducedMotion;
     }
     if (typeof parsed.performanceMode === 'boolean') {
       validated.performanceMode = parsed.performanceMode;
     }
-    if (['low', 'medium', 'high'].includes(parsed.fragmentQuality)) {
+    if (['low', 'medium', 'high', 'ultra'].includes(parsed.fragmentQuality)) {
       validated.fragmentQuality = parsed.fragmentQuality;
+    }
+    if (['low', 'medium', 'high', 'ultra'].includes(parsed.graphicsDetail)) {
+      validated.graphicsDetail = parsed.graphicsDetail;
     }
     
     return validated;
@@ -610,6 +674,13 @@ export const useGameStore = create<GameState>((set, get) => ({
       localStorage.setItem('battlebot_settings', JSON.stringify(updated));
     } catch (e) {
       console.error(e);
+    }
+    if (key === 'soundVolume') {
+      try {
+        updateAudioVolume(value as number);
+      } catch (err) {
+        console.error("Failed to update volume:", err);
+      }
     }
     return { settings: updated };
   }),
@@ -1147,6 +1218,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       botState: { ...INITIAL_BOT, name: state.botConfig.name },
       opponentState: INITIAL_OPPONENT,
       debris: [],
+      fragments: [],
       sparks: [],
       matchCount: state.matchCount + 1
     }));
@@ -1156,6 +1228,12 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   debris: [],
+  fragments: [],
+  spawnFragment: (frag) => {
+    set((state) => ({
+      fragments: [...state.fragments, frag]
+    }));
+  },
   spawnDebris: (position, amount, impactVector) => {
     const settings = get().settings;
     

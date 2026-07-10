@@ -1,47 +1,117 @@
 const fs = require('fs');
-let store = fs.readFileSync('src/store.ts', 'utf8');
+const code = fs.readFileSync('src/components/Arena3D.tsx', 'utf8');
 
-// Add imports
-store = store.replace('import { create } from "zustand";', 'import { create } from "zustand";\nimport { DamageableComponent, ImpactEvent } from "./combat/DamageTypes";\nimport { DamageSystem } from "./combat/DamageSystem";');
+const target = `            if (partDef && partDef.colliders && partDef.colliders.length > 0) {
+              return (
+                <group key={tr.instanceId} position={tr.world.position} rotation={tr.world.rotation}>
+                  {partDef.colliders.map((col, idx) => {
+                    if (col.kind === 'box' || col.kind === 'wedge') {
+                      return (
+                        <CuboidCollider 
+                          key={\`\${tr.instanceId}-\${idx}\`}
+                          args={[col.dimensions[0] / 2, col.dimensions[1] / 2, col.dimensions[2] / 2]} 
+                          position={col.localPosition} 
+                          rotation={col.localRotation}
+                          restitution={settings.collisionRestitution} friction={0.2} 
+                        />
+                      );
+                    }
+                    if (col.kind === 'cylinder') {
+                      return (
+                        <CylinderCollider 
+                          key={\`\${tr.instanceId}-\${idx}\`}
+                          args={[col.dimensions[0] / 2, col.dimensions[1]]} 
+                          position={col.localPosition}
+                          rotation={col.localRotation}
+                          restitution={settings.collisionRestitution} friction={0.2} 
+                        />
+                      );
+                    }
+                    if (col.kind === 'capsule') {
+                      return (
+                        <CapsuleCollider 
+                          key={\`\${tr.instanceId}-\${idx}\`}
+                          args={[Math.max(0.01, col.dimensions[0] - col.dimensions[1]) / 2, col.dimensions[1] / 2]} 
+                          position={col.localPosition}
+                          rotation={col.localRotation}
+                          restitution={settings.collisionRestitution} friction={0.2} 
+                        />
+                      );
+                    }
+                    return null;
+                  })}
+                </group>
+              );
+            }
+            
+            return null;`
 
-// Add to GameState interface
-store = store.replace('botState: BotState;', 'botState: BotState;\n  playerDamageComponents: Record<string, DamageableComponent>;\n  opponentDamageComponents: Record<string, DamageableComponent>;\n  initDamageComponents: () => void;\n  processImpactEvent: (event: ImpactEvent | null) => void;');
+const replacement = `            if (partDef && partDef.colliders && partDef.colliders.length > 0) {
+              return (
+                <group key={tr.instanceId} position={tr.world.position} rotation={tr.world.rotation}>
+                  {partDef.colliders.map((col, idx) => {
+                    if (col.kind === 'box' || col.kind === 'wedge') {
+                      return (
+                        <CuboidCollider 
+                          key={\`\${tr.instanceId}-\${idx}\`}
+                          args={[col.dimensions[0] / 2, col.dimensions[1] / 2, col.dimensions[2] / 2]} 
+                          position={col.localPosition} 
+                          rotation={col.localRotation}
+                          restitution={settings.collisionRestitution} friction={0.2} 
+                        />
+                      );
+                    }
+                    if (col.kind === 'cylinder') {
+                      return (
+                        <CylinderCollider 
+                          key={\`\${tr.instanceId}-\${idx}\`}
+                          args={[col.dimensions[0] / 2, col.dimensions[1]]} 
+                          position={col.localPosition}
+                          rotation={col.localRotation}
+                          restitution={settings.collisionRestitution} friction={0.2} 
+                        />
+                      );
+                    }
+                    if (col.kind === 'capsule') {
+                      return (
+                        <CapsuleCollider 
+                          key={\`\${tr.instanceId}-\${idx}\`}
+                          args={[Math.max(0.01, col.dimensions[0] - col.dimensions[1]) / 2, col.dimensions[1] / 2]} 
+                          position={col.localPosition}
+                          rotation={col.localRotation}
+                          restitution={settings.collisionRestitution} friction={0.2} 
+                        />
+                      );
+                    }
+                    return null;
+                  })}
+                </group>
+              );
+            } else if (partDef) {
+               // Fallback collider based on part shape
+               const [w, h, d] = partDef.size || [0.5, 0.5, 0.5];
+               return (
+                 <group key={tr.instanceId} position={tr.world.position} rotation={tr.world.rotation}>
+                   {partDef.visualKind === 'cylinder' ? (
+                     <CylinderCollider 
+                       args={[d / 2, w / 2]} 
+                       restitution={settings.collisionRestitution} friction={0.2} 
+                     />
+                   ) : (
+                     <CuboidCollider 
+                       args={[w / 2, h / 2, d / 2]} 
+                       restitution={settings.collisionRestitution} friction={0.2} 
+                     />
+                   )}
+                 </group>
+               );
+            }
+            
+            return null;`
 
-// Add implementation
-store = store.replace('setBotState: (state) => set((prev)', `playerDamageComponents: {},
-  opponentDamageComponents: {},
-  initDamageComponents: () => set((state) => ({
-    playerDamageComponents: {
-      front: DamageSystem.createDefaultComponent("front", "player", "Front Armor", "front"),
-      left: DamageSystem.createDefaultComponent("left", "player", "Left Armor", "left"),
-      right: DamageSystem.createDefaultComponent("right", "player", "Right Armor", "right"),
-      rear: DamageSystem.createDefaultComponent("rear", "player", "Rear Armor", "rear"),
-      top: DamageSystem.createDefaultComponent("top", "player", "Top Armor", "top"),
-      core: DamageSystem.createDefaultComponent("core", "player", "Core Chassis", "core"),
-    },
-    opponentDamageComponents: {
-      front: DamageSystem.createDefaultComponent("front", "opponent", "Front Armor", "front"),
-      left: DamageSystem.createDefaultComponent("left", "opponent", "Left Armor", "left"),
-      right: DamageSystem.createDefaultComponent("right", "opponent", "Right Armor", "right"),
-      rear: DamageSystem.createDefaultComponent("rear", "opponent", "Rear Armor", "rear"),
-      top: DamageSystem.createDefaultComponent("top", "opponent", "Top Armor", "top"),
-      core: DamageSystem.createDefaultComponent("core", "opponent", "Core Chassis", "core"),
-    }
-  })),
-  processImpactEvent: (event) => {
-    if (!event) return;
-    
-    // Add marks and components logic here
-    
-    // Also do legacy damage bot updating
-    if (event.damageAmount > 0) {
-       setTimeout(() => get().damageBot(event.defenderId as any, event.damageAmount), 0);
-    }
-  },
-  setBotState: (state) => set((prev)`);
-
-// Add to resetBattle and startBattle
-store = store.replace("get().addLog('Battle simulator reset. Prepare your vehicle.', 'info');", "get().initDamageComponents();\n    get().addLog('Battle simulator reset. Prepare your vehicle.', 'info');");
-store = store.replace("get().addLog(`SYSTEM START: Arena lock engaged.`, 'info');", "get().initDamageComponents();\n    get().addLog(`SYSTEM START: Arena lock engaged.`, 'info');");
-
-fs.writeFileSync('src/store.ts', store);
+if(code.indexOf(target) !== -1) {
+  fs.writeFileSync('src/components/Arena3D.tsx', code.replace(target, replacement));
+  console.log('patched successfully');
+} else {
+  console.log('target not found');
+}

@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+import { HybridArmorPanelProfile } from "../combat/material/HybridArmorMaterial";
 import { ModularPart, PartCollider, Transform3, ResolvedPartTransform, Vec3 } from '../types';
 
 export interface PartTemplate {
@@ -12,6 +12,7 @@ export interface PartTemplate {
   health: number;
   armor: number;
   damage: number;
+  hybridProfile?: HybridArmorPanelProfile;
   connectionPoints: {
     id: string;
     x: number;
@@ -334,14 +335,14 @@ export const PART_TEMPLATES: PartTemplate[] = [
     type: "weapon",
     label: "Vertical Spinner Disk",
     shape: "cylinder",
-    size: [0.85, 0.85, 0.08],
+    size: [0.34, 0.34, 0.08],
     color: "#e65100",
     mass: 25,
     health: 90,
     armor: 80,
     damage: 85,
     visualKind: 'cylinder',
-    colliders: [{ kind: 'cylinder', localPosition: [0, 0, 0], localRotation: [0, 0, Math.PI/2], dimensions: [0.08, 0.85, 0.85] }],
+    colliders: [{ kind: 'cylinder', localPosition: [0, 0, 0], localRotation: [0, 0, Math.PI/2], dimensions: [0.08, 0.34, 0.34] }],
     connectionPoints: [],
     description: "High-inertia vertical rotating disc. Delivers massive kinetic shockwaves upon direct contact.",
     cost: 300
@@ -351,14 +352,14 @@ export const PART_TEMPLATES: PartTemplate[] = [
     type: "weapon",
     label: "High-RPM Heavy Drum",
     shape: "cylinder",
-    size: [0.65, 0.65, 0.4],
+    size: [0.34, 0.34, 0.9],
     color: "#d32f2f",
     mass: 28,
     health: 90,
     armor: 85,
     damage: 75,
     visualKind: 'cylinder',
-    colliders: [{ kind: 'cylinder', localPosition: [0, 0, 0], localRotation: [0, 0, Math.PI/2], dimensions: [0.4, 0.65, 0.65] }],
+    colliders: [{ kind: 'cylinder', localPosition: [0, 0, 0], localRotation: [0, 0, Math.PI/2], dimensions: [0.9, 0.34, 0.34] }],
     connectionPoints: [],
     description: "Ultra-heavy drum spinner. Direct energy transfer that launches bots vertically.",
     cost: 280
@@ -416,7 +417,121 @@ export const PART_TEMPLATES: PartTemplate[] = [
     description: "Overhead mechanical drop-hammer. Devastating top-down structural compression hits.",
     cost: 350
   },
-
+  {
+    templateId: "weapon_pickaxe",
+    type: "weapon",
+    label: "Tungsten Pickaxe",
+    shape: "box",
+    size: [0.15, 0.4, 0.6],
+    color: "#e0e0e0",
+    mass: 25,
+    health: 80,
+    armor: 95,
+    damage: 120,
+    visualKind: 'box',
+    colliders: [{ kind: 'box', localPosition: [0, 0, 0], localRotation: [0, 0, 0], dimensions: [0.15, 0.4, 0.6] }],
+    connectionPoints: [],
+    description: "Sharp concentrated point that punctures thick top armor.",
+    cost: 380
+  },
+  {
+    templateId: "mount_hammer_arm",
+    type: "mount",
+    label: "Hydraulic Hammer Arm",
+    shape: "box",
+    size: [0.2, 0.8, 0.2],
+    color: "#222222",
+    mass: 15,
+    health: 85,
+    armor: 80,
+    damage: 0,
+    visualKind: 'box',
+    colliders: [{ kind: 'box', localPosition: [0, 0, 0], localRotation: [0, 0, 0], dimensions: [0.2, 0.8, 0.2] }],
+    connectionPoints: [
+      { id: "weapon_mount", x: 0, y: 0.35, z: 0.1, socketType: "weapon" }
+    ],
+    description: "Extended reaching arm for mounting overhead smash weapons.",
+    cost: 150
+  },
+  {
+    templateId: "armor_spike",
+    type: "armor",
+    label: "Ramming Spike",
+    shape: "cylinder",
+    size: [0.1, 0.1, 0.5],
+    color: "#aaaaaa",
+    mass: 8,
+    health: 60,
+    armor: 85,
+    damage: 15,
+    visualKind: 'cylinder',
+    colliders: [{ kind: 'cylinder', localPosition: [0, 0, 0], localRotation: [Math.PI/2, 0, 0], dimensions: [0.1, 0.1, 0.5] }],
+    connectionPoints: [],
+    description: "Frontal combat spike designed to spear into opponents during rams.",
+    cost: 80
+  },
+  {
+    templateId: "armor_ablative",
+    type: "armor",
+    label: "Ablative Ceramic Plate",
+    shape: "box",
+    size: [0.8, 0.1, 0.4],
+    color: "#ffffff",
+    mass: 10,
+    health: 150,
+    armor: 30,
+    damage: 0,
+    visualKind: 'box',
+    colliders: [{ kind: 'box', localPosition: [0, 0, 0], localRotation: [0, 0, 0], dimensions: [0.8, 0.1, 0.4] }],
+    connectionPoints: [],
+    description: "Sacrificial armor that absorbs massive kinetic shockwaves by shattering layer by layer.",
+    cost: 120
+  },
+  {
+    templateId: "wheel_tread",
+    type: "wheel",
+    label: "Continuous Track",
+    shape: "box",
+    size: [0.2, 0.3, 0.9],
+    color: "#111111",
+    mass: 30,
+    health: 120,
+    armor: 90,
+    damage: 0,
+    visualKind: 'box',
+    colliders: [{ kind: 'box', localPosition: [0, 0, 0], localRotation: [0, 0, 0], dimensions: [0.2, 0.3, 0.9] }],
+    connectionPoints: [],
+    description: "Heavy tank treads with immense pushing power but low top speed.",
+    cost: 250
+  },
+  {
+    templateId: "core_behemoth",
+    type: "chassis",
+    label: "Behemoth Core",
+    shape: "box",
+    size: [1.6, 0.4, 1.8],
+    color: "#1c1c1c",
+    mass: 85,
+    health: 140,
+    armor: 100,
+    damage: 0,
+    visualKind: 'box',
+    colliders: [{ kind: 'box', localPosition: [0, 0, 0], localRotation: [0, 0, 0], dimensions: [1.6, 0.4, 1.8] }],
+    connectionPoints: [
+      { id: "left_wheel_1", x: -0.9, y: 0.0, z: -0.6, socketType: "wheel" },
+      { id: "left_wheel_2", x: -0.9, y: 0.0, z: 0.0, socketType: "wheel" },
+      { id: "left_wheel_3", x: -0.9, y: 0.0, z: 0.6, socketType: "wheel" },
+      { id: "right_wheel_1", x: 0.9, y: 0.0, z: -0.6, socketType: "wheel" },
+      { id: "right_wheel_2", x: 0.9, y: 0.0, z: 0.0, socketType: "wheel" },
+      { id: "right_wheel_3", x: 0.9, y: 0.0, z: 0.6, socketType: "wheel" },
+      { id: "front_weapon_1", x: -0.4, y: 0.0, z: -1.0, socketType: "weapon" },
+      { id: "front_weapon_2", x: 0.4, y: 0.0, z: -1.0, socketType: "weapon" },
+      { id: "rear_armor", x: 0.0, y: 0.0, z: 1.0, socketType: "armor" },
+      { id: "top_mount", x: 0.0, y: 0.25, z: 0.0, socketType: "any" }
+    ],
+    description: "Massive 6-wheel chassis designed for overwhelming weight and pushing power.",
+    cost: 500
+  },
   // DEFENSE / WEDGES
   {
     templateId: "armor_wedge",
@@ -438,6 +553,42 @@ export const PART_TEMPLATES: PartTemplate[] = [
   {
     templateId: "armor_panel",
     type: "armor",
+    hybridProfile: {
+      kind: "hybridCompositeDuctileArmor",
+      totalThickness: 0.05,
+      compositeFace: {
+        density: 1600,
+        thickness: 0.02,
+        fiberAngleRadians: 0,
+        E1: 135e9, E2: 10e9, G12: 5e9, nu12: 0.3,
+        Xt: 1500e6, Xc: 1200e6, Yt: 50e6, Yc: 250e6, S12: 100e6,
+        GIc: 1000, GIIc: 2000, mixedModeExponent: 1.5,
+        fiberDamageFloor: 0.1, matrixDamageFloor: 0.01, shearDamageFloor: 0.05,
+        fatigueStart: 0.2, fatigueExponent: 2, fatigueAmplification: 1.5,
+        bendingComplianceParallel: 0.001, bendingComplianceTransverse: 0.01
+      },
+      ductileBacking: {
+        material: "Steel",
+        density: 7850,
+        thickness: 0.03,
+        youngsModulus: 200e9, poissonRatio: 0.29,
+        yieldStress: 500e6, hardeningModulus: 2e9, ductilityLimit: 0.15,
+        bendingYieldMomentScale: 1.0, bendingHardeningScale: 1.0,
+        fractureEnergyPerArea: 50000,
+        fatigueStart: 0.5, fatigueExponent: 1.5, fatigueAmplification: 2.0
+      },
+      interface: {
+        normalCohesiveStiffness: 1e12, shearCohesiveStiffness: 1e12,
+        normalStrength: 60e6, shearStrength: 60e6,
+        modeIFractureEnergy: 1000, modeIIFractureEnergy: 2000, mixedModeExponent: 1.5,
+        fatigueStart: 0.3, fatigueExponent: 2.0, fatigueAmplification: 1.5
+      },
+      visualDamage: {
+        intactRoughness: 0.2, damagedRoughness: 0.8,
+        fiberExposureColor: "#d3d3d3", matrixCrackColor: "#1a1a1a", exposedBackingColor: "#a0a0a0",
+        heatTintEnergyDensityThreshold: 1e6
+      }
+    },
     label: "Composite Side Panel",
     shape: "box",
     size: [0.1, 0.38, 1.2],
@@ -514,103 +665,24 @@ export const generatePartFromTemplate = (template: PartTemplate, partId: string)
 
 import { PlacedBotPart, CustomBotConfig } from '../types';
 
+
+import { finalizeAssemblyPlan } from './assembly';
+import * as THREE from 'three';
+
 export const resolvePartTransformsV2 = (parts: PlacedBotPart[], rootPartId: string): ResolvedPartTransform[] => {
-  const resolved: ResolvedPartTransform[] = [];
-  const partMap = new Map<string, PlacedBotPart>();
-  parts.forEach(p => partMap.set(p.instanceId, p));
-
-  const resolvedMap = new Map<string, ResolvedPartTransform>();
-  const visited = new Set<string>();
-
-  const resolve = (instanceId: string, depth: number): ResolvedPartTransform | null => {
-    if (resolvedMap.has(instanceId)) return resolvedMap.get(instanceId)!;
-    
-    // Cycle detection
-    if (visited.has(instanceId)) {
-      console.warn('Cycle detected at part:', instanceId);
-      return null; 
-    }
-    visited.add(instanceId);
-
-    const part = partMap.get(instanceId);
-    if (!part) return null;
-
-    const local: Transform3 = {
-      position: [...part.localPosition] as [number, number, number],
-      rotation: [...part.localRotation] as [number, number, number],
+  const mockConfig: CustomBotConfig = { id: 'tmp', name: 'tmp', schemaVersion: 1, rootPartId, parts, createdAt: 0, updatedAt: 0 };
+  const plan = finalizeAssemblyPlan(mockConfig);
+  return plan.nodes.map(n => {
+    const q = new THREE.Quaternion(n.worldTransform.rotation[0], n.worldTransform.rotation[1], n.worldTransform.rotation[2], n.worldTransform.rotation[3]);
+    const e = new THREE.Euler().setFromQuaternion(q);
+    return {
+      instanceId: n.instanceId,
+      definitionId: n.definitionId,
+      local: { position: n.localPosition, rotation: n.localRotation },
+      world: { position: n.worldTransform.position, rotation: [e.x, e.y, e.z] },
+      parentInstanceId: n.parentInstanceId,
+      depth: 0
     };
-
-    if (!part.parentInstanceId) {
-      const res: ResolvedPartTransform = {
-        instanceId: part.instanceId,
-        definitionId: part.definitionId,
-        local,
-        world: local,
-        depth
-      };
-      resolvedMap.set(part.instanceId, res);
-      visited.delete(instanceId);
-      return res;
-    }
-
-    const parentRes = resolve(part.parentInstanceId, depth + 1);
-    if (!parentRes) {
-      visited.delete(instanceId);
-      return null;
-    }
-
-    // In Phase 1, we also need to account for the socket's local offset on the parent.
-    // However, PlacedBotPart's `localPosition` is usually the socket's position 
-    // + any user offsets. Let's assume `localPosition` incorporates the socket offset for simplicity in the resolver, 
-    // OR if we want to be strict, we look up the socket definition here.
-    // Given the prompt: "compose parent -> socket -> child transforms recursively"
-    
-    // For now, let's keep it simple: the builder sets part.localPosition to exactly what the user placed 
-    // (relative to parent).
-    
-    const parentObj = new THREE.Object3D();
-    parentObj.position.set(...parentRes.world.position);
-    parentObj.rotation.set(...parentRes.world.rotation);
-
-    const childObj = new THREE.Object3D();
-    childObj.position.set(...local.position);
-    childObj.rotation.set(...local.rotation);
-
-    parentObj.add(childObj);
-    parentObj.updateMatrixWorld(true);
-
-    const worldPos = new THREE.Vector3();
-    const worldQuat = new THREE.Quaternion();
-    const worldScale = new THREE.Vector3();
-    childObj.matrixWorld.decompose(worldPos, worldQuat, worldScale);
-    const euler = new THREE.Euler().setFromQuaternion(worldQuat);
-
-    const res: ResolvedPartTransform = {
-      instanceId: part.instanceId,
-      definitionId: part.definitionId,
-      local,
-      world: {
-        position: [worldPos.x, worldPos.y, worldPos.z],
-        rotation: [euler.x, euler.y, euler.z]
-      },
-      parentInstanceId: part.parentInstanceId,
-      depth
-    };
-    resolvedMap.set(part.instanceId, res);
-    visited.delete(instanceId);
-    return res;
-  };
-
-  // Resolve starting from root, then any orphans if we want them (but validation flags them)
-  const rootRes = resolve(rootPartId, 0);
-  if (rootRes) resolved.push(rootRes);
-
-  parts.forEach(p => {
-    if (!resolvedMap.has(p.instanceId)) {
-       const res = resolve(p.instanceId, 0);
-       if (res) resolved.push(res);
-    }
   });
-
-  return resolved;
 };
+
