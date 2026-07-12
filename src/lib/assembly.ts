@@ -86,6 +86,35 @@ export function finalizeAssemblyPlan(candidate: CustomBotConfig): AssemblyPlan {
       
       childObj.getWorldPosition(worldPos);
       childObj.getWorldQuaternion(worldQuat);
+
+      // Symmetrical Wheel Alignment Adjustment:
+      // Ensure the tire and rim do not intersect/clip into the chassis by offsetting them outward
+      if (def.type === 'wheel') {
+        const d = (def.size && def.size[2]) || 0.2;
+        const offset = d / 2 + 0.04; // Half-width plus 0.04m clearance
+        if (worldPos.x > 0.01) {
+          localTrans.position[0] += offset;
+        } else if (worldPos.x < -0.01) {
+          localTrans.position[0] -= offset;
+        }
+        
+        // Re-compose with the correct offset
+        childObj.position.set(...localTrans.position);
+        parentObj.updateMatrixWorld(true);
+        childObj.getWorldPosition(worldPos);
+        childObj.getWorldQuaternion(worldQuat);
+      }
+    } else {
+      if (def.type === 'wheel') {
+        const d = (def.size && def.size[2]) || 0.2;
+        const offset = d / 2 + 0.04;
+        if (worldPos.x > 0.01) {
+          localTrans.position[0] += offset;
+        } else if (worldPos.x < -0.01) {
+          localTrans.position[0] -= offset;
+        }
+        worldPos.set(...localTrans.position);
+      }
     }
 
     const node: ResolvedAssemblyNode = {
@@ -94,7 +123,7 @@ export function finalizeAssemblyPlan(candidate: CustomBotConfig): AssemblyPlan {
       category: def.type as any,
       parentInstanceId: part.parentInstanceId,
       parentSocketId: part.parentSocketId,
-      localPosition: [...part.localPosition] as Vec3,
+      localPosition: [...localTrans.position] as Vec3,
       localRotation: [...part.localRotation] as Vec3,
       worldTransform: {
         position: [worldPos.x, worldPos.y, worldPos.z],
@@ -140,7 +169,13 @@ export function finalizeAssemblyPlan(candidate: CustomBotConfig): AssemblyPlan {
        const rollingDir = new THREE.Vector3(0, 0, -1).applyQuaternion(worldQuat).normalize();
        const groundDir = new THREE.Vector3(0, -1, 0).applyQuaternion(worldQuat).normalize();
        
-       const wRadius = (def.size && def.size[1]/2) || 0.25;
+       const isCylinder = def.shape === 'cylinder';
+       const wRadius = isCylinder 
+         ? ((def.size && def.size[0]) || 0.25) 
+         : ((def.size && def.size[1] / 2) || 0.25);
+       const wWidth = isCylinder 
+         ? ((def.size && def.size[2]) || 0.2) 
+         : ((def.size && def.size[0]) || 0.2);
        
        node.wheel = {
          partInstanceId: instanceId,
@@ -150,9 +185,9 @@ export function finalizeAssemblyPlan(candidate: CustomBotConfig): AssemblyPlan {
          rollingDirectionWorld: [rollingDir.x, rollingDir.y, rollingDir.z],
          groundDirectionWorld: [groundDir.x, groundDir.y, groundDir.z],
          tireRadius: wRadius,
-         tireWidth: (def.size && def.size[0]) || 0.2,
+         tireWidth: wWidth,
          rimRadius: wRadius * 0.8,
-         rimWidth: (def.size && def.size[0]) || 0.2,
+         rimWidth: wWidth,
          meshRotation: [worldQuat.x, worldQuat.y, worldQuat.z, worldQuat.w],
          colliderRotation: [worldQuat.x, worldQuat.y, worldQuat.z, worldQuat.w],
          motorAxisWorld: [axleAxis.x, axleAxis.y, axleAxis.z],

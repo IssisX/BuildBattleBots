@@ -366,39 +366,10 @@ const WedgeMesh = ({ size, color, emissive, emissiveIntensity }: { size: [number
   }, [color, damageFactor]);
 
   const geom = useMemo(() => {
-    try {
-      const shape = new THREE.Shape();
-      const bevel = 0.015;
-      shape.moveTo(-d/2 + bevel, -h/2 + bevel);
-      shape.lineTo(d/2 - bevel, -h/2 + bevel);
-      shape.lineTo(d/2 - bevel, h/2 - bevel);
-      shape.closePath();
-
-      const extrudeSettings = {
-        depth: Math.max(0.01, w - bevel * 2),
-        bevelEnabled: true,
-        bevelSegments: 3,
-        steps: 1,
-        bevelSize: bevel,
-        bevelThickness: bevel
-      };
-      const geo = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-      geo.center();
-      geo.rotateY(Math.PI / 2);
-      return geo;
-    } catch (err) {
-      console.error(err);
-      // Fallback
-      const shape = new THREE.Shape();
-      shape.moveTo(-d/2, -h/2);
-      shape.lineTo(d/2, -h/2);
-      shape.lineTo(-d/2, h/2);
-      shape.closePath();
-      const g = new THREE.ExtrudeGeometry(shape, { depth: w, bevelEnabled: false });
-      g.center();
-      g.rotateY(Math.PI / 2);
-      return g;
-    }
+    const wSegs = Math.max(8, Math.ceil(w * 24));
+    const hSegs = Math.max(8, Math.ceil(h * 24));
+    const dSegs = Math.max(8, Math.ceil(d * 24));
+    return new THREE.BoxGeometry(w, h, d, wSegs, hSegs, dSegs);
   }, [w, h, d]);
 
   return (
@@ -425,42 +396,10 @@ const RoundedBoxMesh = ({ size, color, emissive, emissiveIntensity }: { size: [n
   }, [color, damageFactor]);
 
   const geom = useMemo(() => {
-    try {
-      const radius = Math.min(w, h, d, 0.04);
-      const bevel = 0.01;
-      const shape = new THREE.Shape();
-      const width = Math.max(0.01, w - radius * 2);
-      const height = Math.max(0.01, h - radius * 2);
-      const x = -width / 2;
-      const y = -height / 2;
-
-      shape.moveTo(x, y + radius);
-      shape.lineTo(x, y + height);
-      shape.quadraticCurveTo(x, y + height + radius, x + radius, y + height + radius);
-      shape.lineTo(x + width, y + height + radius);
-      shape.quadraticCurveTo(x + width + radius, y + height + radius, x + width + radius, y + height);
-      shape.lineTo(x + width + radius, y + radius);
-      shape.quadraticCurveTo(x + width + radius, y, x + width, y);
-      shape.lineTo(x + radius, y);
-      shape.quadraticCurveTo(x, y, x, y + radius);
-
-      const extrudeSettings = {
-        depth: Math.max(0.01, d - bevel * 2),
-        bevelEnabled: true,
-        bevelSegments: 3,
-        steps: 1,
-        bevelSize: bevel,
-        bevelThickness: bevel,
-        curveSegments: 12
-      };
-
-      const geo = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-      geo.center();
-      return geo;
-    } catch (err) {
-      console.error(err);
-      return new THREE.BoxGeometry(w, h, d);
-    }
+    const wSegs = Math.max(8, Math.ceil(w * 24));
+    const hSegs = Math.max(8, Math.ceil(h * 24));
+    const dSegs = Math.max(8, Math.ceil(d * 24));
+    return new THREE.BoxGeometry(w, h, d, wSegs, hSegs, dSegs);
   }, [w, h, d]);
 
   return (
@@ -813,6 +752,23 @@ const Bot = ({
 
         const propResult = propagateImpactLoad(mState, packet, assemblyPlan);
         
+        // Procedural Deformation Visual Update!
+        globalDeformation.applyDent({
+          eventId: packet.eventId,
+          botId: isPlayer ? 'player' : 'opponent',
+          partInstanceId: packet.struckPartInstanceId,
+          localContactPoint: packet.worldContactPoint, // world space
+          localImpactDirection: packet.linearImpulseWorld, // world space direction
+          normalEnergy: packet.normalEnergy,
+          tangentialEnergy: packet.tangentialEnergy,
+          peakImpulse: impulseAmt,
+          obliquityRadians: 0,
+          radius: Math.min(0.8, 0.2 + (impulseAmt / 500)), // dynamic dent radius based on force
+          depth: Math.min(0.4, impulseAmt / 1000), // dynamic depth
+          plasticity: 0.8, // high plasticity for metal
+          scratchBias: 0.5
+        });
+
         propResult.damageEvents.forEach(msg => {
           addLog(msg, "warning");
         });
@@ -1131,7 +1087,7 @@ const Bot = ({
              useGameStore.getState().spawnSparks([posRaw.x, 0.05, posRaw.z], 3, '#FFAA00');
              // Drag friction
              const dragScale = currentBotConfig.armor.weight / 10;
-             bodyRef.current.applyImpulse({ x: -linvel.x * 0.15 * delta * dragScale, y: 0, z: -linvel.z * 0.15 * delta * dragScale }, true);
+             bodyRef.current.applyImpulse({ x: -linvel.x * 0.15 * delta , y: 0, z: -linvel.z * 0.15 * delta  }, true);
          }
       }
       
@@ -1142,7 +1098,7 @@ const Bot = ({
          const rightDir = new THREE.Vector3(1, 0, 0).applyEuler(euler);
          // Push the bot "out" of the turn
          const driftScale = currentBotConfig.armor.weight / 10;
-         bodyRef.current.applyImpulse({ x: rightDir.x * Math.sign(turnRate) * driftAmount * 15.0 * driftScale, y: 0, z: rightDir.z * Math.sign(turnRate) * driftAmount * 15.0 * driftScale }, true);
+         bodyRef.current.applyImpulse({ x: rightDir.x * Math.sign(turnRate) * driftAmount * 15.0 , y: 0, z: rightDir.z * Math.sign(turnRate) * driftAmount * 15.0  }, true);
          if (Math.random() < 0.15) {
              useGameStore.getState().spawnSparks([posRaw.x, 0.05, posRaw.z], 1, '#888888'); // tire smoke/dust
          }
@@ -1150,7 +1106,7 @@ const Bot = ({
 
       globalPhysicsState[isPlayer ? 'player' : 'opponent'].pos.set(posRaw.x, posRaw.y, posRaw.z);
       globalPhysicsState[isPlayer ? 'player' : 'opponent'].vel.set(linvel.x, linvel.y, linvel.z);
-      globalPhysicsState[isPlayer ? 'player' : 'opponent'].mass = currentBotConfig.armor.weight * settings.chassisMassScale;
+      globalPhysicsState[isPlayer ? 'player' : 'opponent'].mass = (currentBotConfig.armor.weight / 10) * settings.chassisMassScale;
       
       // Animation State Update
       const myState = globalPhysicsState[isPlayer ? 'player' : 'opponent'];
@@ -1473,8 +1429,8 @@ const Bot = ({
         } else {
           const centerDir = new THREE.Vector3(0 - currentPos.x, 0, 0 - currentPos.z).normalize();
           const massScale = currentBotConfig.armor.weight / 10;
-          bodyRef.current.applyImpulse({ x: centerDir.x * 10 * massScale, y: 3 * massScale, z: centerDir.z * 10 * massScale }, true);
-          bodyRef.current.applyTorqueImpulse({ x: 1 * massScale, y: 3 * massScale, z: 1 * massScale }, true);
+          bodyRef.current.applyImpulse({ x: centerDir.x * 10 , y: 3 , z: centerDir.z * 10  }, true);
+          bodyRef.current.applyTorqueImpulse({ x: 1 , y: 3 , z: 1  }, true);
           useGameStore.getState().addLog(`Stuck lock resolved for ${isPlayer ? 'Player' : 'Opponent'}.`, 'info');
         }
       }
@@ -1533,14 +1489,14 @@ const Bot = ({
 
           forces.forEach(f => {
             bodyRef.current.applyImpulseAtPoint(
-              { x: f.force[0] * finalDelta, y: f.force[1] * finalDelta, z: f.force[2] * finalDelta },
+              { x: f.force[0] * finalDelta * 0.1, y: f.force[1] * finalDelta * 0.1, z: f.force[2] * finalDelta * 0.1 },
               { x: f.point[0], y: f.point[1], z: f.point[2] },
               true
             );
           });
 
           bodyRef.current.applyTorqueImpulse(
-            { x: reactionTorque[0] * finalDelta, y: reactionTorque[1] * finalDelta, z: reactionTorque[2] * finalDelta },
+            { x: reactionTorque[0] * finalDelta * 0.1, y: reactionTorque[1] * finalDelta * 0.1, z: reactionTorque[2] * finalDelta * 0.1 },
             true
           );
 
@@ -1554,7 +1510,7 @@ const Bot = ({
           );
 
           bodyRef.current.applyTorqueImpulse(
-            { x: weaponResult.reactionTorque[0] * finalDelta, y: weaponResult.reactionTorque[1] * finalDelta, z: weaponResult.reactionTorque[2] * finalDelta },
+            { x: weaponResult.reactionTorque[0] * finalDelta * 0.1, y: weaponResult.reactionTorque[1] * finalDelta * 0.1, z: weaponResult.reactionTorque[2] * finalDelta * 0.1 },
             true
           );
 
@@ -1618,14 +1574,14 @@ const Bot = ({
 
           forces.forEach(f => {
             bodyRef.current.applyImpulseAtPoint(
-              { x: f.force[0] * finalDelta, y: f.force[1] * finalDelta, z: f.force[2] * finalDelta },
+              { x: f.force[0] * finalDelta * 0.1, y: f.force[1] * finalDelta * 0.1, z: f.force[2] * finalDelta * 0.1 },
               { x: f.point[0], y: f.point[1], z: f.point[2] },
               true
             );
           });
 
           bodyRef.current.applyTorqueImpulse(
-            { x: reactionTorque[0] * finalDelta, y: reactionTorque[1] * finalDelta, z: reactionTorque[2] * finalDelta },
+            { x: reactionTorque[0] * finalDelta * 0.1, y: reactionTorque[1] * finalDelta * 0.1, z: reactionTorque[2] * finalDelta * 0.1 },
             true
           );
 
@@ -1639,7 +1595,7 @@ const Bot = ({
           );
 
           bodyRef.current.applyTorqueImpulse(
-            { x: weaponResult.reactionTorque[0] * finalDelta, y: weaponResult.reactionTorque[1] * finalDelta, z: weaponResult.reactionTorque[2] * finalDelta },
+            { x: weaponResult.reactionTorque[0] * finalDelta * 0.1, y: weaponResult.reactionTorque[1] * finalDelta * 0.1, z: weaponResult.reactionTorque[2] * finalDelta * 0.1 },
             true
           );
 
@@ -1685,7 +1641,7 @@ const Bot = ({
 
           if (analogY !== 0) {
               const driveScale = config.armor.weight / 10;
-              bodyRef.current.applyImpulse({ x: -dir.x * analogY * speed * delta * 15 * driveScale, y: 0, z: -dir.z * analogY * speed * delta * 15 * driveScale }, true);
+              bodyRef.current.applyImpulse({ x: -dir.x * analogY * speed * delta * 15 , y: 0, z: -dir.z * analogY * speed * delta * 15  }, true);
           } else {
               // Apply forward/backward linear braking to make controls super sharp and responsive
               const currentLinVel = bodyRef.current.linvel();
@@ -1753,7 +1709,7 @@ const Bot = ({
               // Dampen speed significantly to prevent "shooting across the map"
               const driveFactor = Math.max(0, dot);
               const driveScale = opponentConfig.armor.weight / 10;
-              bodyRef.current.applyImpulse({ x: dir.x * speed * delta * 5.0 * driveFactor * driveScale, y: 0, z: dir.z * speed * delta * 5.0 * driveFactor * driveScale }, true);
+              bodyRef.current.applyImpulse({ x: dir.x * speed * delta * 5.0 * driveFactor , y: 0, z: dir.z * speed * delta * 5.0 * driveFactor  }, true);
             }
             
             // Smoothly steer towards the player using torque instead of forcefully setting rotation
@@ -1820,14 +1776,14 @@ const Bot = ({
                  const oppWeightMult = Math.max(0.8, oppWeightRaw / 100);
 
                  if (actualWeaponType === 'flipper') {
-                     targetRef.current.applyImpulse({ x: dir.x * 150 * settings.impactImpulseScale / oppWeightMult, y: 200 * settings.impactImpulseScale / oppWeightMult, z: dir.z * 150 * settings.impactImpulseScale / oppWeightMult }, true);
-                     targetRef.current.applyTorqueImpulse({ x: (Math.random() - 0.5) * 200 * settings.impactImpulseScale, y: (Math.random() - 0.5) * 200 * settings.impactImpulseScale, z: (Math.random() - 0.5) * 200 * settings.impactImpulseScale }, true);
-                     bodyRef.current.applyImpulse({ x: -dir.x * 150 * 1.0, y: -100 * 1.0, z: -dir.z * 150 * 1.0 }, true); 
+                     targetRef.current.applyImpulse({ x: dir.x * 15 * settings.impactImpulseScale / oppWeightMult, y: 20 * settings.impactImpulseScale / oppWeightMult, z: dir.z * 15 * settings.impactImpulseScale / oppWeightMult }, true);
+                     targetRef.current.applyTorqueImpulse({ x: (Math.random() - 0.5) * 20 * settings.impactImpulseScale, y: (Math.random() - 0.5) * 20 * settings.impactImpulseScale, z: (Math.random() - 0.5) * 20 * settings.impactImpulseScale }, true);
+                     bodyRef.current.applyImpulse({ x: -dir.x * 15 * 1.0, y: -10 * 1.0, z: -dir.z * 15 * 1.0 }, true); 
                  } else if (actualWeaponType === 'hammer') {
-                     targetRef.current.applyImpulse({ x: 0, y: -600 * settings.impactImpulseScale / oppWeightMult, z: 0 }, true);
-                     bodyRef.current.applyImpulse({ x: 0, y: 300 * 1.0, z: 0 }, true); 
+                     targetRef.current.applyImpulse({ x: 0, y: -60 * settings.impactImpulseScale / oppWeightMult, z: 0 }, true);
+                     bodyRef.current.applyImpulse({ x: 0, y: 30 * 1.0, z: 0 }, true); 
                  } else if (actualWeaponType === 'crusher') {
-                     targetRef.current.applyImpulse({ x: -dir.x * 200 * settings.impactImpulseScale / oppWeightMult, y: -400 * settings.impactImpulseScale / oppWeightMult, z: -dir.z * 200 * settings.impactImpulseScale / oppWeightMult }, true);
+                     targetRef.current.applyImpulse({ x: -dir.x * 20 * settings.impactImpulseScale / oppWeightMult, y: -40 * settings.impactImpulseScale / oppWeightMult, z: -dir.z * 20 * settings.impactImpulseScale / oppWeightMult }, true);
                  }
              }
           }
@@ -1847,7 +1803,7 @@ const Bot = ({
         ref={bodyRef} 
         position={position} 
         colliders={false} 
-        mass={currentBotConfig.armor.weight * settings.chassisMassScale} 
+        mass={(currentBotConfig.armor.weight / 10) * settings.chassisMassScale} 
         type="dynamic" 
         lockRotations={false} 
         lockTranslations={false} 
@@ -1928,7 +1884,7 @@ const Bot = ({
                // --- HIGH IMPACT PHYSICS UPGRADE 1: Kinetic Collision Recoil & Rotational Instability ---
                if (impactEnergy > 2 && bodyRef.current && targetRef.current) {
                  // Scale impulse based on mass and speed
-                 const baseForce = Math.min(normalVelocity * 4.0, 100) * settings.impactImpulseScale;
+                 const baseForce = Math.min(normalVelocity * 0.4, 10) * settings.impactImpulseScale;
                  
                  // Calculate directional force vectors
                  const recoilDir = normalVec.clone().normalize();
@@ -1936,14 +1892,14 @@ const Bot = ({
                  const pushZ = recoilDir.z * baseForce;
                  
                  // Determine vertical pop/lift (heavy hits or spinner hits pop bots into the air!)
-                 const liftForce = (className === 'heavy' || className === 'weapon') ? (Math.min(normalVelocity * 3.0, 50) * settings.impactImpulseScale) : 0;
+                 const liftForce = (className === 'heavy' || className === 'weapon') ? (Math.min(normalVelocity * 0.3, 5) * settings.impactImpulseScale) : 0;
                  
                  // Apply repulsive linear impulses to push bots apart realistically
                  targetRef.current.applyImpulse({ x: pushX, y: liftForce, z: pushZ }, true);
                  bodyRef.current.applyImpulse({ x: -pushX, y: liftForce * 0.2, z: -pushZ }, true);
                  
                  // Apply angular torque impulses to induce realistic spinout, roll, or tipping
-                 const torquePower = Math.min(normalVelocity * 15.0, 120) * settings.impactImpulseScale;
+                 const torquePower = Math.min(normalVelocity * 1.5, 12) * settings.impactImpulseScale;
                  
                  // Defender wobbles, tips, and spins out violently
                  targetRef.current.applyTorqueImpulse({
@@ -2086,6 +2042,12 @@ const Bot = ({
             <CuboidCollider args={[0.1, 0.25, 0.7]} position={[-0.65, 0.35, 0]} restitution={settings.collisionRestitution} friction={0.4} />
             {/* Right Armor */}
             <CuboidCollider args={[0.1, 0.25, 0.7]} position={[0.65, 0.35, 0]} restitution={settings.collisionRestitution} friction={0.4} />
+            
+            {/* Abstract Low-Friction Wheel Colliders so the bot rolls smoothly */}
+            <CylinderCollider args={[0.15, 0.42]} position={[-0.9, 0.42, 0.6]} rotation={[0, 0, Math.PI / 2]} friction={0.0} />
+            <CylinderCollider args={[0.15, 0.42]} position={[0.9, 0.42, 0.6]} rotation={[0, 0, Math.PI / 2]} friction={0.0} />
+            <CylinderCollider args={[0.15, 0.42]} position={[-0.9, 0.42, -0.6]} rotation={[0, 0, Math.PI / 2]} friction={0.0} />
+            <CylinderCollider args={[0.15, 0.42]} position={[0.9, 0.42, -0.6]} rotation={[0, 0, Math.PI / 2]} friction={0.0} />
           </>
         ) : (
           resolvedParts.map((tr) => {
@@ -2093,6 +2055,8 @@ const Bot = ({
             const mNode = mechanicalStateRef.current?.nodes.find(n => n.partInstanceId === tr.instanceId);
             const isDetached = mNode && (mNode.failureState === 'detached' || mNode.failureState === 'failed');
             if (isDetached) return null;
+
+            const isWheelPart = partDef && (partDef.type === 'wheel' || partDef.category === 'wheel');
 
             if (partDef && partDef.colliders && partDef.colliders.length > 0) {
               return (
@@ -2105,7 +2069,7 @@ const Bot = ({
                           args={[col.dimensions[0] / 2, col.dimensions[1] / 2, col.dimensions[2] / 2]} 
                           position={col.localPosition} 
                           rotation={col.localRotation}
-                          restitution={settings.collisionRestitution} friction={0.2} 
+                          restitution={settings.collisionRestitution} friction={isWheelPart ? 0.0 : 0.2} 
                         />
                       );
                     }
@@ -2113,10 +2077,10 @@ const Bot = ({
                       return (
                         <CylinderCollider 
                           key={`${tr.instanceId}-${idx}`}
-                          args={[col.dimensions[0] / 2, col.dimensions[1]]} 
+                          args={[col.dimensions[0] / 2, col.dimensions[1] / 2]} 
                           position={col.localPosition}
                           rotation={col.localRotation}
-                          restitution={settings.collisionRestitution} friction={0.2} 
+                          restitution={settings.collisionRestitution} friction={isWheelPart ? 0.0 : 0.2} 
                         />
                       );
                     }
@@ -2127,7 +2091,7 @@ const Bot = ({
                           args={[Math.max(0.01, col.dimensions[0] - col.dimensions[1]) / 2, col.dimensions[1] / 2]} 
                           position={col.localPosition}
                           rotation={col.localRotation}
-                          restitution={settings.collisionRestitution} friction={0.2} 
+                          restitution={settings.collisionRestitution} friction={isWheelPart ? 0.0 : 0.2} 
                         />
                       );
                     }
@@ -2143,12 +2107,12 @@ const Bot = ({
                    {partDef.visualKind === 'cylinder' ? (
                      <CylinderCollider 
                        args={[d / 2, w / 2]} 
-                       restitution={settings.collisionRestitution} friction={0.2} 
+                       restitution={settings.collisionRestitution} friction={isWheelPart ? 0.0 : 0.2} 
                      />
                    ) : (
                      <CuboidCollider 
                        args={[w / 2, h / 2, d / 2]} 
-                       restitution={settings.collisionRestitution} friction={0.2} 
+                       restitution={settings.collisionRestitution} friction={isWheelPart ? 0.0 : 0.2} 
                      />
                    )}
                  </group>
@@ -2175,6 +2139,7 @@ const Bot = ({
               const color = part.color || partDef.color || '#fff';
               const visualKind = partDef.visualKind;
               const pType = partDef.type || partDef.category;
+              const isRightWheel = pType === 'wheel' && tr.local.position[0] > 0;
 
               return (
                 <group 
@@ -2236,7 +2201,7 @@ const Bot = ({
                         <group name="VerticalSpinnerDisk" rotation={[0, 0, 0]}>
                           {/* Core Disk rotating along X axis */}
                           <mesh castShadow receiveShadow rotation={[0, 0, Math.PI / 2]}>
-                            <cylinderGeometry args={[w, w, d, 24]} />
+                            <cylinderGeometry args={[w, w, d, 24, Math.max(2, Math.ceil(d * 4))]} />
                             <meshStandardMaterial color="#1a1a1a" metalness={0.95} roughness={0.1} />
                           </mesh>
                           {/* Metallic Trim Plate */}
@@ -2264,9 +2229,9 @@ const Bot = ({
                           })}
                         </group>
                       ) : (
-                        <group name="WheelSpinGroup" rotation={(pType === 'wheel') ? [0, 0, Math.PI / 2] : [0, 0, 0]}>
+                        <group name="WheelSpinGroup" rotation={(pType === 'wheel') ? [0, 0, isRightWheel ? -Math.PI / 2 : Math.PI / 2] : [0, 0, 0]}>
                           <mesh castShadow receiveShadow>
-                            <cylinderGeometry args={[w, w, d, 24]} />
+                            <cylinderGeometry args={[w, w, d, 24, Math.max(2, Math.ceil(d * 4))]} />
                             <meshStandardMaterial color={color} metalness={0.8} roughness={0.2} />
                           </mesh>
                           {/* Wheel details */}
@@ -2855,7 +2820,7 @@ const Bot = ({
                     const targetWeightMult = Math.max(0.8, targetWeightRaw / 100);
                     const pushForce = 5.0 * Math.abs(currentRPM.current) * settings.impactImpulseScale / targetWeightMult;
                     
-                    targetRef.current.applyImpulse({ x: dnx * pushForce, y: 80 * settings.impactImpulseScale / targetWeightMult, z: dnz * pushForce }, true);
+                    targetRef.current.applyImpulse({ x: dnx * pushForce, y: 8 * settings.impactImpulseScale / targetWeightMult, z: dnz * pushForce }, true);
                     bodyRef.current.applyImpulse({ x: -dnx * pushForce * 0.4, y: 0, z: -dnz * pushForce * 0.4 }, true);
                     
                     const pos = bodyRef.current.translation();
@@ -2963,10 +2928,10 @@ const Bot = ({
                     
                     // Direct hit applies massive vertical lift and horizontal push
                     // Glancing hit applies less lift, more deflection
-                    const maxLift = 600 * settings.impactImpulseScale;
-                    const maxPush = 400 * settings.impactImpulseScale;
-                    const liftForce = Math.min((isDirect ? 400 : 200) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxLift);
-                    const pushForce = Math.min((isDirect ? 250 : 100) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxPush);
+                    const maxLift = 60 * settings.impactImpulseScale;
+                    const maxPush = 40 * settings.impactImpulseScale;
+                    const liftForce = Math.min((isDirect ? 40 : 20) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxLift);
+                    const pushForce = Math.min((isDirect ? 25 : 10) * rpmRatio * settings.impactImpulseScale / targetWeightMult * glanceRatio, maxPush);
                     
                     targetBody.applyImpulse({ x: collisionNormal.x * pushForce, y: liftForce, z: collisionNormal.z * pushForce }, true);
                     
@@ -3022,12 +2987,24 @@ const Bot = ({
           {/* Front Right */}
           {damageComponents?.right?.visualState !== 'detached' && (
           <group ref={frontRightWheelRef} position={[0.9, 0.4, -0.6]}>
+            {/* Tire (Outer Rubber) */}
             <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.42, 0.42, 0.3, 16]} />
               <meshStandardMaterial color="#1a1a1a" roughness={0.9} />
             </mesh>
+            {/* Metallic Rim (Centered inside tire) */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+              <cylinderGeometry args={[0.26, 0.26, 0.31, 16]} />
+              <meshStandardMaterial color="#4a4a4a" metalness={0.85} roughness={0.15} />
+            </mesh>
+            {/* Hub Cap Face */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+              <cylinderGeometry args={[0.12, 0.12, 0.32, 12]} />
+              <meshStandardMaterial color="#999999" metalness={0.95} roughness={0.05} />
+            </mesh>
+            {/* Axle Shaft going into chassis */}
             <mesh castShadow position={[-0.2, 0, 0]} rotation={[0, 0, Math.PI / 2]}>
-              <cylinderGeometry args={[0.1, 0.1, 0.4, 8]} />
+              <cylinderGeometry args={[0.06, 0.06, 0.4, 8]} />
               <meshStandardMaterial color="#555" metalness={0.8} />
             </mesh>
             {/* Visual contrast radial bolt indicators */}
@@ -3037,7 +3014,7 @@ const Bot = ({
                 <mesh 
                   key={b} 
                   castShadow 
-                  position={[0.16, Math.cos(angle) * 0.22, Math.sin(angle) * 0.22]}
+                  position={[0.16, Math.cos(angle) * 0.18, Math.sin(angle) * 0.18]}
                 >
                   <boxGeometry args={[0.04, 0.06, 0.06]} />
                   <meshStandardMaterial color="#FFC107" metalness={0.9} roughness={0.1} />
@@ -3050,21 +3027,34 @@ const Bot = ({
           {/* Front Left */}
           {damageComponents?.left?.visualState !== 'detached' && (
           <group ref={frontLeftWheelRef} position={[-0.9, 0.4, -0.6]}>
+            {/* Tire (Outer Rubber) */}
             <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.42, 0.42, 0.3, 16]} />
               <meshStandardMaterial color="#1a1a1a" roughness={0.9} />
             </mesh>
+            {/* Metallic Rim (Centered inside tire) */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+              <cylinderGeometry args={[0.26, 0.26, 0.31, 16]} />
+              <meshStandardMaterial color="#4a4a4a" metalness={0.85} roughness={0.15} />
+            </mesh>
+            {/* Hub Cap Face */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+              <cylinderGeometry args={[0.12, 0.12, 0.32, 12]} />
+              <meshStandardMaterial color="#999999" metalness={0.95} roughness={0.05} />
+            </mesh>
+            {/* Axle Shaft going into chassis */}
             <mesh castShadow position={[0.2, 0, 0]} rotation={[0, 0, Math.PI / 2]}>
-              <cylinderGeometry args={[0.1, 0.1, 0.4, 8]} />
+              <cylinderGeometry args={[0.06, 0.06, 0.4, 8]} />
               <meshStandardMaterial color="#555" metalness={0.8} />
             </mesh>
+            {/* Visual contrast radial bolt indicators */}
             {[0, 1, 2, 3].map((b) => {
               const angle = (b * Math.PI) / 2;
               return (
                 <mesh 
                   key={b} 
                   castShadow 
-                  position={[-0.16, Math.cos(angle) * 0.22, Math.sin(angle) * 0.22]}
+                  position={[-0.16, Math.cos(angle) * 0.18, Math.sin(angle) * 0.18]}
                 >
                   <boxGeometry args={[0.04, 0.06, 0.06]} />
                   <meshStandardMaterial color="#FFC107" metalness={0.9} roughness={0.1} />
@@ -3077,21 +3067,34 @@ const Bot = ({
           {/* Back Right */}
           {damageComponents?.right?.visualState !== 'detached' && (
           <group ref={backRightWheelRef} position={[0.9, 0.4, 0.6]}>
+            {/* Tire (Outer Rubber) */}
             <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.42, 0.42, 0.3, 16]} />
               <meshStandardMaterial color="#1a1a1a" roughness={0.9} />
             </mesh>
+            {/* Metallic Rim (Centered inside tire) */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+              <cylinderGeometry args={[0.26, 0.26, 0.31, 16]} />
+              <meshStandardMaterial color="#4a4a4a" metalness={0.85} roughness={0.15} />
+            </mesh>
+            {/* Hub Cap Face */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+              <cylinderGeometry args={[0.12, 0.12, 0.32, 12]} />
+              <meshStandardMaterial color="#999999" metalness={0.95} roughness={0.05} />
+            </mesh>
+            {/* Axle Shaft going into chassis */}
             <mesh castShadow position={[-0.2, 0, 0]} rotation={[0, 0, Math.PI / 2]}>
-              <cylinderGeometry args={[0.1, 0.1, 0.4, 8]} />
+              <cylinderGeometry args={[0.06, 0.06, 0.4, 8]} />
               <meshStandardMaterial color="#555" metalness={0.8} />
             </mesh>
+            {/* Visual contrast radial bolt indicators */}
             {[0, 1, 2, 3].map((b) => {
               const angle = (b * Math.PI) / 2;
               return (
                 <mesh 
                   key={b} 
                   castShadow 
-                  position={[0.16, Math.cos(angle) * 0.22, Math.sin(angle) * 0.22]}
+                  position={[0.16, Math.cos(angle) * 0.18, Math.sin(angle) * 0.18]}
                 >
                   <boxGeometry args={[0.04, 0.06, 0.06]} />
                   <meshStandardMaterial color="#FFC107" metalness={0.9} roughness={0.1} />
@@ -3104,21 +3107,34 @@ const Bot = ({
           {/* Back Left */}
           {damageComponents?.left?.visualState !== 'detached' && (
           <group ref={backLeftWheelRef} position={[-0.9, 0.4, 0.6]}>
+            {/* Tire (Outer Rubber) */}
             <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.42, 0.42, 0.3, 16]} />
               <meshStandardMaterial color="#1a1a1a" roughness={0.9} />
             </mesh>
+            {/* Metallic Rim (Centered inside tire) */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+              <cylinderGeometry args={[0.26, 0.26, 0.31, 16]} />
+              <meshStandardMaterial color="#4a4a4a" metalness={0.85} roughness={0.15} />
+            </mesh>
+            {/* Hub Cap Face */}
+            <mesh castShadow rotation={[0, 0, Math.PI / 2]}>
+              <cylinderGeometry args={[0.12, 0.12, 0.32, 12]} />
+              <meshStandardMaterial color="#999999" metalness={0.95} roughness={0.05} />
+            </mesh>
+            {/* Axle Shaft going into chassis */}
             <mesh castShadow position={[0.2, 0, 0]} rotation={[0, 0, Math.PI / 2]}>
-              <cylinderGeometry args={[0.1, 0.1, 0.4, 8]} />
+              <cylinderGeometry args={[0.06, 0.06, 0.4, 8]} />
               <meshStandardMaterial color="#555" metalness={0.8} />
             </mesh>
+            {/* Visual contrast radial bolt indicators */}
             {[0, 1, 2, 3].map((b) => {
               const angle = (b * Math.PI) / 2;
               return (
                 <mesh 
                   key={b} 
                   castShadow 
-                  position={[-0.16, Math.cos(angle) * 0.22, Math.sin(angle) * 0.22]}
+                  position={[-0.16, Math.cos(angle) * 0.18, Math.sin(angle) * 0.18]}
                 >
                   <boxGeometry args={[0.04, 0.06, 0.06]} />
                   <meshStandardMaterial color="#FFC107" metalness={0.9} roughness={0.1} />
@@ -3664,11 +3680,11 @@ const DebrisSystem = () => {
             type="dynamic"
           >
             <mesh castShadow receiveShadow>
-              {partDef.visualKind === 'box' && <boxGeometry args={[w, h, d]} />}
-              {partDef.visualKind === 'wedge' && <boxGeometry args={[w, h, d]} />}
-              {partDef.visualKind === 'cylinder' && <cylinderGeometry args={[w, w, d, 24]} />}
+              {partDef.visualKind === 'box' && <boxGeometry args={[w, h, d, Math.max(2, Math.ceil(w * 8)), Math.max(2, Math.ceil(h * 8)), Math.max(2, Math.ceil(d * 8))]} />}
+              {partDef.visualKind === 'wedge' && <boxGeometry args={[w, h, d, Math.max(2, Math.ceil(w * 8)), Math.max(2, Math.ceil(h * 8)), Math.max(2, Math.ceil(d * 8))]} />}
+              {partDef.visualKind === 'cylinder' && <cylinderGeometry args={[w, w, d, 24, Math.max(2, Math.ceil(d * 4))]} />}
               {partDef.visualKind === 'capsule' && <capsuleGeometry args={[h/2, Math.max(0.01, w - h), 16, 16]} />}
-              {(!partDef.visualKind || partDef.visualKind === 'slope') && <boxGeometry args={[w, h, d]} />}
+              {(!partDef.visualKind || partDef.visualKind === 'slope') && <boxGeometry args={[w, h, d, Math.max(2, Math.ceil(w * 8)), Math.max(2, Math.ceil(h * 8)), Math.max(2, Math.ceil(d * 8))]} />}
               
               <meshStandardMaterial color={frag.color} metalness={0.7} roughness={0.3} />
             </mesh>

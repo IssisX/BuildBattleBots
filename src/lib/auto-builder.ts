@@ -121,8 +121,10 @@ export function generateAutoBot(options: AutoBuildOptions): CustomBotConfig {
   const chosenSideArmor = pickRandom(sideTemplates);
   const chosenRearArmor = pickRandom(rearTemplates);
 
+  const applyArmor = options.archetype === 'armoredRammer' || random() > 0.3;
+
   for (const as of armorSockets) {
-    if (options.archetype === 'armoredRammer' || random() > 0.3) {
+    if (applyArmor) {
       const isRear = as.id.includes('rear') || as.id.includes('back');
       const isSide = as.id.includes('left') || as.id.includes('right') || as.id.includes('side');
       let templateToUse = null;
@@ -153,8 +155,16 @@ export function generateAutoBot(options: AutoBuildOptions): CustomBotConfig {
     for (const issue of plan.issues) {
       if (issue.severity === 'error') {
          if (issue.code === 'mass-limit-exceeded') {
-            const armorIdx = newParts.findIndex(p => p.parentSocketId?.includes('armor'));
-            if (armorIdx >= 0) newParts.splice(armorIdx, 1);
+            const armorIndices = [];
+            for (let i = 0; i < newParts.length; i++) {
+              if (newParts[i].parentSocketId?.includes('armor')) {
+                armorIndices.push(i);
+              }
+            }
+            // Remove all armor to save weight symmetrically
+            for (let i = armorIndices.length - 1; i >= 0; i--) {
+              newParts.splice(armorIndices[i], 1);
+            }
          } else if (issue.code === 'orphan-part' || issue.code === 'cycle-detected' || issue.code === 'incompatible-socket' || issue.code === 'occupied-socket') {
             for (const pid of issue.partInstanceIds) {
                const idx = newParts.findIndex(p => p.instanceId === pid);

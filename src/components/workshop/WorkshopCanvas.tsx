@@ -178,12 +178,12 @@ const PartMesh = ({ part, worldPos, worldRot, def, onSelectPart }: { part: Place
             {(def.category === 'wheel' || (def as any).type === 'wheel') && (
               <>
                 {/* Metallic Alloy Rim */}
-                <mesh castShadow position={[0, d / 2 + 0.005, 0]} rotation={[Math.PI / 2, 0, 0]}>
+                <mesh castShadow position={[0, 0, 0]} rotation={[0, 0, 0]}>
                   <cylinderGeometry args={[w * 0.65, w * 0.65, d + 0.01, 16]} />
                   <meshStandardMaterial color="#2a2a2a" metalness={0.9} roughness={0.1} />
                 </mesh>
                 {/* Chrome Hub Cap */}
-                <mesh castShadow position={[0, d / 2 + 0.015, 0]} rotation={[Math.PI / 2, 0, 0]}>
+                <mesh castShadow position={[0, 0, 0]} rotation={[0, 0, 0]}>
                   <cylinderGeometry args={[w * 0.25, w * 0.25, d + 0.02, 12]} />
                   <meshStandardMaterial color="#e0e0e0" metalness={0.95} roughness={0.05} />
                 </mesh>
